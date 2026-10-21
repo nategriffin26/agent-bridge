@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.agent-bridge.pump</string>
+  <!-- Sends any due Mac -> box webhook wakes (backoff, 15 s per attempt, at most ~45 s per run). Silent when idle. -->
+  <key>ProgramArguments</key><array><string>__HOME__/bin/agent-bridge</string><string>_pump</string></array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin</string></dict>
+  <key>StandardOutPath</key><string>__HOME__/.agent-bridge/logs/pump.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.agent-bridge/logs/pump.log</string>
+</dict>
+</plist>
