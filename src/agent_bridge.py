@@ -518,10 +518,12 @@ def op_ack(c, mid, me=None):
         m = get_msg(c, mid)
         if me and not mine(c, me, m):
             raise Fail(f"message {mid} is not addressed to {me}")
-        if m["direction"] == "in" or me is None:
-            if m["rcpt"] is None and me:
-                c.execute("UPDATE messages SET rcpt=? WHERE id=?", (me, mid))
-            advance(c, mid, "acked")
+        if m["direction"] != "in":
+            raise Fail(f"{mid} is outbound to {m['to_addr']}; the box confirms it with 'mark', and an ack here would "
+                       f"drop it from export before it arrives")
+        if m["rcpt"] is None and me:
+            c.execute("UPDATE messages SET rcpt=? WHERE id=?", (me, mid))
+        advance(c, mid, "acked")
     return f"acked {mid}"
 
 
@@ -614,6 +616,7 @@ def op_register(c, meta):
                    meta.get("pid"), HOST, sid, meta.get("session_file"), old["started_at"] if same else t, t,
                    meta.get("state") or "idle", meta.get("ext_version")))
         event(c, "register", agent=aid, pid=meta.get("pid"), refresh=bool(same))
+        release_alias_mail(c, aliases)   # a crashed predecessor never exited cleanly; its alias mail comes here
     return {"id": aid, "aliases": aliases, "tmux_target": target}
 
 
@@ -632,11 +635,27 @@ def op_heartbeat(c, aid, state=None, model=None, provider=None, ext=None):
     return {"pending": n, "policy": POLICY_VERSION}
 
 
+def release_alias_mail(c, aliases):
+    """Unread mail sent to an alias, bound to a session that is no longer live, goes back to the alias so whichever
+    session carries it next can see it. Mail sent to an exact id stays with that id. Runs inside a transaction."""
+    for alias in aliases:
+        for m in c.execute("SELECT m.id, m.rcpt FROM messages m JOIN deliveries d ON d.msg_id=m.id WHERE "
+                           "d.direction='in' AND d.state IN ('queued','notified') AND m.to_addr=? AND m.rcpt IS NOT NULL "
+                           "AND m.rcpt != m.to_addr", (alias,)).fetchall():
+            r = agent_row(c, m["rcpt"])
+            if not r or status_of(r) != "live":
+                c.execute("UPDATE messages SET rcpt=NULL WHERE id=?", (m["id"],))
+                event(c, "released", m["id"], m["rcpt"], alias=alias)
+
+
 def op_exit(c, aid, reason):
     with tx(c):
         c.execute("UPDATE agents SET state='exited', exit_reason=?, heartbeat_at=? WHERE id=? AND kind='omp'",
                   (reason, now(), aid))
         event(c, "exit", agent=aid, reason=reason)
+        r = agent_row(c, aid)
+        if r:
+            release_alias_mail(c, json.loads(r["aliases"]))
     return {"ok": True}
 
 

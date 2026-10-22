@@ -256,6 +256,29 @@ class Bridge(unittest.TestCase):
         self.assertEqual([m["id"] for m in json.loads(self.ab("pending", me).stdout)["new"]], [mid2])
         self.assertEqual(self.db().execute("SELECT notify_count FROM deliveries WHERE msg_id=?", (mid2,)).fetchone()[0], 2)
 
+    def test_alias_mail_follows_the_alias_when_its_session_leaves_unread(self):
+        old = self.register("s1", tmux="/tmp/sock", tmux_pane="%5")["id"]           # alias omp/e2e
+        mid = self.ab("deliver", self.box_token("omp/e2e")).stdout.split()[1]
+        exact = self.ab("deliver", self.box_token(old)).stdout.split()[1]          # to the exact id: stays with it
+        self.ab("exit", old, "quit")
+        new = self.register("s2", tmux="/tmp/sock", tmux_pane="%5")["id"]           # next session in that tmux
+        inbox = self.call("bridge_inbox", new)[1]
+        self.assertIn(mid, inbox)
+        self.assertNotIn(exact, inbox)
+        crashed = new                                                                # no clean exit this time
+        mid2 = self.ab("deliver", self.box_token("omp/e2e")).stdout.split()[1]
+        self.db().execute("UPDATE agents SET heartbeat_at=heartbeat_at-500 WHERE id=?", (crashed,)).connection.commit()
+        third = self.register("s3", tmux="/tmp/sock", tmux_pane="%5")["id"]
+        self.assertIn(mid2, self.call("bridge_inbox", third)[1])
+
+    def test_ack_refuses_outbound_mail_so_it_still_reaches_the_box(self):
+        me = self.register("s1")["id"]
+        mid = self.call("bridge_send", me, to="dross", message="ping")[1].split()[1]
+        r = self.ab("ack", mid, check=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("outbound", r.stderr)
+        self.assertEqual(len(self.ab("export").stdout.split()), 1)
+
     def test_alias_resolution_and_held_mail(self):
         a = self.register("s1", tmux="/tmp/sock", tmux_pane="%5")["id"]
         b = self.register("s2", tmux="/tmp/sock", tmux_pane="%6")["id"]        # same tmux session: alias ambiguous
