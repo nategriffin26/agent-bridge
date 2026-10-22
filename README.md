@@ -73,6 +73,20 @@ The box keeps its own bridge copy (the v1 file under `tests/v1/` is wire-compati
 
 `box/make-roster-token.py` signs `roster.json` (`[{"name": "dross", "label": "Dross"}, …]`) with the shared secret.
 
+## Local bots
+
+A bot that runs on the Mac behind its own HTTP endpoint gets a bridge address too:
+
+```sh
+agent-bridge local add ops --label Ops --webhook http://127.0.0.1:3100/api/v1/bots/ops/webhook --token-file ~/.ops-token
+agent-bridge send --as ops --token-file ~/.ops-token [--reply-to ID] omp/worker "done"
+agent-bridge local rm ops
+```
+
+- Mail to it is POSTed to its webhook with its bearer token: the box payload plus plain `body`, `reply_to` and `thread`. A 2xx counts as delivered; failures retry with the same backoff.
+- `send --as` proves the sender by its token file, so its messages carry the owner's authority like a box bot's.
+- The database stores the token file's path, never the token. Adding a local bot archives a box bot of the same name, and later box rosters can't bring it back while the local one exists.
+
 ## Architecture
 
 - **One file, stdlib only.** `src/agent_bridge.py` is the store, CLI, stdio MCP server, webhook pump and tmux fallback. One owner of all state.

@@ -16,9 +16,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 VERSION = "2.0.0"
-SCHEMA = 1
+SCHEMA = 2
 MAX_BODY = 32 * 1024
 BOX = set()                            # box agent addresses (e.g. Grok bots), loaded from the store; the box's roster sets it
+LOCAL = {}                             # local bot address -> {webhook, token_file}, set with `agent-bridge local add`
 EXITED_KEEP = 3600                     # an exited omp row is archived after this long ...
 STALE_KEEP = 86400                     # ... and a stale one after this long (pump runs the prune every minute)
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,47}$")
@@ -152,13 +153,24 @@ def is_omp(a):
     return isinstance(a, str) and a.startswith("omp/") and bool(NAME_RE.match(a[4:]))
 
 
-def is_bot(a):
-    """A box agent on the current roster (agents rows of kind 'box'); dross always counts."""
+def is_box(a):
+    """A bot on the box's signed roster (agents rows of kind 'box'); dross always counts. Only these can send to the
+    Mac inside an HMAC-verified token."""
     return a == "dross" or a in BOX
 
 
+def is_local(a):
+    """A bot on this Mac with its own webhook (agents rows of kind 'local'), added with `agent-bridge local add`."""
+    return a in LOCAL
+
+
+def is_bot(a):
+    """Any bot address (box or local): mail to it goes out through a webhook, never to an omp inbox."""
+    return is_box(a) or is_local(a)
+
+
 def as_addr(a):
-    """A box agent stays as it is; 'foo' and 'omp/foo' both mean omp/foo."""
+    """A bot stays as it is; 'foo' and 'omp/foo' both mean omp/foo."""
     a = (a or "").strip()
     return a if is_bot(a) or a.startswith("omp/") else "omp/" + a
 
@@ -174,7 +186,7 @@ CREATE TABLE IF NOT EXISTS agents(
   id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'omp', label TEXT, aliases TEXT NOT NULL DEFAULT '[]',
   cwd TEXT, repo TEXT, branch TEXT, model TEXT, provider TEXT, tmux_target TEXT, tmux_pane TEXT,
   pid INTEGER, host TEXT, session_id TEXT, session_file TEXT, started_at REAL, heartbeat_at REAL,
-  state TEXT, exit_reason TEXT, ext_version TEXT);
+  state TEXT, exit_reason TEXT, ext_version TEXT, webhook TEXT, token_file TEXT);
 CREATE TABLE IF NOT EXISTS agents_archive(id TEXT NOT NULL, archived_at REAL NOT NULL, row TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY, from_addr TEXT NOT NULL, to_addr TEXT NOT NULL, rcpt TEXT, ts INTEGER NOT NULL,
@@ -218,10 +230,14 @@ def connect():
     c.row_factory = sqlite3.Row
     if fresh:
         os.chmod(DB, 0o600)
-    if c.execute("PRAGMA user_version").fetchone()[0] != SCHEMA:
+    version = c.execute("PRAGMA user_version").fetchone()[0]
+    if version != SCHEMA:
         if c.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
             c.execute("PRAGMA journal_mode=WAL")
         with tx(c):
+            if version == 1:   # v1 -> v2: local agents keep their webhook and the path of their token file
+                c.execute("ALTER TABLE agents ADD COLUMN webhook TEXT")
+                c.execute("ALTER TABLE agents ADD COLUMN token_file TEXT")
             for stmt in DDL.split(";"):
                 if stmt.strip():
                     c.execute(stmt)
@@ -229,7 +245,12 @@ def connect():
             c.execute(f"PRAGMA user_version={SCHEMA}")
     c.execute("PRAGMA synchronous=FULL")
     BOX.clear()
-    BOX.update(r[0] for r in c.execute("SELECT id FROM agents WHERE kind='box'"))
+    LOCAL.clear()
+    for r in c.execute("SELECT * FROM agents WHERE kind IN ('box', 'local')"):
+        if r["kind"] == "box":
+            BOX.add(r["id"])
+        else:
+            LOCAL[r["id"]] = {"webhook": r["webhook"], "token_file": r["token_file"]}
     return c
 
 
@@ -286,8 +307,8 @@ def pid_alive(pid):
 
 
 def status_of(r, t=None):
-    if r["kind"] == "box":
-        return "box"
+    if r["kind"] in ("box", "local"):
+        return r["kind"]
     if r["state"] == "exited":
         return "exited"
     if (t or now()) - (r["heartbeat_at"] or 0) > STALE_AFTER:
@@ -368,9 +389,11 @@ POLICY_VERSION = hashlib.sha256(POLICY.encode()).hexdigest()[:8]
 
 def sender(c, addr):
     r = agent_row(c, addr) if c else None
-    if is_bot(addr):
-        name = r["label"] if r and r["label"] else addr
+    name = r["label"] if r and r["label"] else addr
+    if is_box(addr):
         return f"{OWNER}'s agent {name} ({addr}, a box bot), acting for {OWNER}; signature verified", TRUST_BOT
+    if is_local(addr):
+        return f"{OWNER}'s agent {name} ({addr}, a local bot), acting for {OWNER}; token verified", TRUST_BOT
     return f"{OWNER}'s omp worker {addr}, a coworker on this Mac", TRUST_WORKER
 
 
@@ -408,15 +431,18 @@ def insert(c, m, origin, thread=None):
     return True
 
 
-def op_send(c, frm, to, body, reply_to=None, thread=None):
+def op_send(c, frm, to, body, reply_to=None, thread=None, as_local=False):
+    """Store and route one message. `as_local` means the caller already proved it holds that local agent's token."""
     guard_on()
     raw_to = (to or "").strip()
-    frm, to = as_addr(frm), as_addr(to)
-    if not is_omp(frm):
-        raise Fail(f"'{frm}' is not an address on this side (omp/<name>)")
+    frm, to = (frm if as_local else as_addr(frm)), as_addr(to)
+    if not (is_local(frm) if as_local else is_omp(frm)):
+        raise Fail(f"'{frm}' is not an address on this side (omp/<name>, or a local bot with its token)")
     if ("/" not in raw_to and not is_bot(raw_to)) or not (is_omp(to) or is_bot(to)):
-        raise Fail(f"'{raw_to}' is not a valid recipient: omp/<name>, or a current box bot "
-                   f"({', '.join(sorted(BOX | {'dross'}))})")
+        raise Fail(f"'{raw_to}' is not a valid recipient: omp/<name>, or a current bot "
+                   f"({', '.join(sorted(BOX | set(LOCAL) | {'dross'}))})")
+    if to == frm:
+        raise Fail("a bot can't message itself")
     if not body or len(body.encode()) > MAX_BODY:
         raise Fail(f"body must be 1..{MAX_BODY} bytes")
     if reply_to and not ID_RE.match(reply_to):
@@ -430,6 +456,9 @@ def op_send(c, frm, to, body, reply_to=None, thread=None):
         insert(c, m, "local", thread or m["id"])
         event(c, "send", m["id"], frm, to=to)
         rcpt = c.execute("SELECT rcpt FROM messages WHERE id=?", (m["id"],)).fetchone()["rcpt"]
+    if is_local(to):
+        spawn("_pump")
+        return m, f"saved {m['id']} for {to}; delivering to its webhook in the background (retries with backoff)"
     if is_bot(to):
         url, _ = webhook()
         if not url:
@@ -457,7 +486,8 @@ def op_import(c, tok, via):
         with tx(c):
             event(c, "reject", str(m.get("id"))[:40] if isinstance(m, dict) else None, why="bad-signature", via=via)
         return False, False, "rejected: bad signature"
-    if not (ID_RE.match(str(m.get("id"))) and is_omp(m.get("to")) and is_bot(m.get("from"))
+    # Only a bot on the box's roster can arrive in a token; it may write to an omp session or to a local bot.
+    if not (ID_RE.match(str(m.get("id"))) and (is_omp(m.get("to")) or is_local(m.get("to"))) and is_box(m.get("from"))
             and isinstance(m.get("body"), str) and isinstance(m.get("ts"), int)):
         with tx(c):
             event(c, "reject", str(m.get("id"))[:40], why="bad-address", via=via)
@@ -469,7 +499,10 @@ def op_import(c, tok, via):
             return True, False, f"duplicate {m['id']} (already stored)"
         event(c, "import", m["id"], m["to"], frm=m["from"], via=via)
         rcpt = c.execute("SELECT rcpt FROM messages WHERE id=?", (m["id"],)).fetchone()["rcpt"]
-    touch_notify(rcpt or m["to"])
+    if is_local(m["to"]):
+        spawn("_pump")
+    else:
+        touch_notify(rcpt or m["to"])
     return True, True, f"stored {m['id']} from {m['from']} for {m['to']}" + (f" (agent {rcpt})" if rcpt and rcpt != m["to"] else "")
 
 
@@ -672,7 +705,7 @@ def agent_json(c, r):
 
 def op_agents(c, which="live", name=None):
     rows = [agent_json(c, r) for r in c.execute("SELECT * FROM agents ORDER BY kind DESC, heartbeat_at DESC")]
-    keep = {"live": ("live", "box"), "stale": ("stale",), "exited": ("exited",)}.get(which)
+    keep = {"live": ("live", "box", "local"), "stale": ("stale",), "exited": ("exited",)}.get(which)
     return [a for a in rows if (not keep or a["status"] in keep)
             and (not name or name.lower() in (a["id"] + " " + " ".join(a["aliases"])).lower())]
 
@@ -685,7 +718,7 @@ def fmt_agents(rows):
         age = int(now() - a["heartbeat_at"]) if a["heartbeat_at"] else None
         seen = f"{age}s ago" if age is not None and age < 120 else (f"{age // 60}m ago" if age is not None else "never")
         bits = [a["id"], a["status"] + (f"/{a['state']}" if a["status"] == "live" else ""), f"seen {seen}"]
-        if a["kind"] == "box" and a["label"] and a["label"] != a["id"]:
+        if a["kind"] in ("box", "local") and a["label"] and a["label"] != a["id"]:
             bits.append(a["label"] + (f" (grok {a['session_id']})" if a["session_id"] else ""))
         if a["aliases"]:
             bits.append("aka " + ",".join(a["aliases"]))
@@ -706,6 +739,43 @@ def archive_agent(c, r, why):
     c.execute("INSERT INTO agents_archive(id, archived_at, row) VALUES(?,?,?)",
               (r["id"], now(), json.dumps({**{k: r[k] for k in r.keys()}, "archived_why": why})))
     c.execute("DELETE FROM agents WHERE id=?", (r["id"],))
+
+
+def op_local_add(c, name, label, url, token_file):
+    """Add (or update) a bot that runs on this Mac behind its own webhook. A box bot of the same name is archived:
+    the desk has moved here, and later box rosters can't bring it back while this row exists."""
+    if not name or not NAME_RE.match(name) or "/" in name or name.startswith("omp"):
+        raise Fail("NAME must be a plain bot name (letters, digits, - _ .), not an omp address")
+    if not (url or "").startswith(("http://", "https://")):
+        raise Fail("--webhook must be an http(s) URL")
+    if not token_file or not read_token(token_file):
+        raise Fail("--token-file must name a readable, non-empty file holding the bot's bearer secret")
+    path = str(Path(token_file).expanduser().resolve())
+    with tx(c):
+        old = agent_row(c, name)
+        if old and old["kind"] == "omp":
+            raise Fail(f"{name} is an omp session")
+        if old and old["kind"] == "box":
+            archive_agent(c, old, "moved-local")
+        c.execute("INSERT OR REPLACE INTO agents(id, kind, label, state, webhook, token_file, started_at, heartbeat_at) "
+                  "VALUES(?, 'local', ?, 'local', ?, ?, ?, ?)", (name, (label or name)[:80], url, path, now(), now()))
+        event(c, "local-add", agent=name, moved=bool(old and old["kind"] == "box"))
+    BOX.discard(name)
+    LOCAL[name] = {"webhook": url, "token_file": path}
+    return f"local bot {name} -> {url}" + (" (box bot of that name archived)" if old and old["kind"] == "box" else "")
+
+
+def op_local_rm(c, name):
+    """Archive a local bot (its messages stay). Mail still queued for it gives up as no-recipient."""
+    with tx(c):
+        r = agent_row(c, name)
+        if not r or r["kind"] != "local":
+            raise Fail(f"{name} is not a local bot")
+        archive_agent(c, r, "removed")
+        event(c, "local-rm", agent=name)
+    LOCAL.pop(name, None)
+    return f"local bot {name} removed (archived; its messages stay)"
+
 
 
 def op_prune(c, exited_after=EXITED_KEEP, stale_after=STALE_KEEP):
@@ -753,7 +823,10 @@ def op_roster(c, tok):
         last = c.execute("SELECT v FROM meta WHERE k='roster_ts'").fetchone()
         if last and int(last["v"]) >= r["ts"]:
             return f"roster ts {r['ts']} is not newer than the applied one ({last['v']}); nothing changed"
+        moved = [n for n in names if is_local(n)]   # a desk that moved to this Mac stays local; the roster can't reclaim it
         for b in bots:
+            if b["name"] in moved:
+                continue
             label, gid = str(b.get("label") or b["name"])[:80], str(b.get("grok_id") or "")[:80] or None
             if agent_row(c, b["name"]):
                 c.execute("UPDATE agents SET label=?, session_id=? WHERE id=? AND kind='box'", (label, gid, b["name"]))
@@ -764,11 +837,13 @@ def op_roster(c, tok):
         for x in retired:
             archive_agent(c, x, "retired")
         c.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('roster_ts', ?)", (str(r["ts"]),))
-        event(c, "roster", bots=names, retired=[x["id"] for x in retired])
+        event(c, "roster", bots=names, retired=[x["id"] for x in retired], kept_local=moved)
         c.execute("UPDATE agents SET heartbeat_at=? WHERE id='dross'", (now(),))
     BOX.clear()
-    BOX.update(names)
-    return f"roster applied: {', '.join(names)}" + (f"; retired {', '.join(x['id'] for x in retired)}" if retired else "")
+    BOX.update(n for n in names if n not in moved)
+    return (f"roster applied: {', '.join(n for n in names if n not in moved)}"
+            + (f"; retired {', '.join(x['id'] for x in retired)}" if retired else "")
+            + (f"; kept local: {', '.join(moved)}" if moved else ""))
 
 
 def ancestry_self(c):
@@ -836,36 +911,60 @@ def post(url, tok, payload):
     return tuple(out) if not t.is_alive() else ("timeout", "no answer within the deadline")
 
 
+def read_token(path):
+    """A local bot's bearer secret, read at send time from its file (never stored in the database or printed)."""
+    try:
+        p = Path(path).expanduser()
+        if p.stat().st_mode & 0o077:
+            os.chmod(p, 0o600)
+        return p.read_text().strip() or None
+    except Exception:
+        return None
+
+
 def op_pump(c, budget=45.0):
-    """Send every due outbound row once. Bounded: one attempt is <= HTTP_S, the run stops claiming after `budget`."""
+    """Send every due outbound row once. Bounded: one attempt is <= HTTP_S, the run stops claiming after `budget`.
+    Box bots share the box webhook (v1 payload, the box confirms with mark). A local bot has its own webhook; its
+    payload adds plain body/reply_to/thread, and a 2xx means delivered (synced)."""
     if is_off():
         return 0
-    url, tok = webhook()
-    if not url:
+    box_url, box_tok = webhook()
+    if not box_url and not LOCAL:
         return 0
+    q = ",".join("?" * len(LOCAL)) or "''"
+    scope = "1=1" if box_url else f"m.to_addr IN ({q})"
     start, sent = now(), 0
     while now() - start < budget:
         t = now()
         with tx(c):
-            d = c.execute("SELECT msg_id, attempts FROM deliveries WHERE direction='out' AND state='pending' AND next_at<=? "
-                          "AND (lease_until IS NULL OR lease_until<?) ORDER BY next_at LIMIT 1", (t, t)).fetchone()
+            d = c.execute(f"SELECT d.msg_id, d.attempts FROM deliveries d JOIN messages m ON m.id=d.msg_id WHERE "
+                          f"d.direction='out' AND d.state='pending' AND d.next_at<=? AND (d.lease_until IS NULL OR "
+                          f"d.lease_until<?) AND {scope} ORDER BY d.next_at LIMIT 1",
+                          [t, t] + ([] if box_url else list(LOCAL))).fetchone()
             if not d:
                 break
             c.execute("UPDATE deliveries SET lease_until=? WHERE msg_id=?", (t + HTTP_S + 15, d["msg_id"]))
         m = c.execute("SELECT * FROM messages WHERE id=?", (d["msg_id"],)).fetchone()
-        payload = json.dumps({"agent_bridge": 1, "id": m["id"], "from": m["from_addr"], "to": m["to_addr"],
-                              "token": token_of(m)}).encode()
-        code, note = post(url, tok, payload)
+        body = {"agent_bridge": 1, "id": m["id"], "from": m["from_addr"], "to": m["to_addr"], "token": token_of(m)}
+        local = LOCAL.get(m["to_addr"])
+        if local:
+            tok = read_token(local["token_file"])
+            body.update(body=m["body"], reply_to=m["reply_to"], thread=m["thread"])
+            code, note = post(local["webhook"], tok, json.dumps(body).encode()) if tok else ("no-token", "token file unreadable")
+        elif is_box(m["to_addr"]):
+            code, note = post(box_url, box_tok, json.dumps(body).encode())
+        else:
+            code, note = "no-recipient", "no bot with that address any more"
         ok = isinstance(code, int) and 200 <= code < 300
         n = d["attempts"] + 1
         with tx(c):
             c.execute("UPDATE deliveries SET attempts=?, last_code=?, lease_until=NULL WHERE msg_id=?", (n, str(code), m["id"]))
             event(c, "webhook", m["id"], m["to_addr"], attempt=n, code=str(code), note=note[:200])
             if ok:
-                advance(c, m["id"], "woken")
-                c.execute("UPDATE agents SET heartbeat_at=? WHERE id=? AND kind='box'", (now(), m["to_addr"]))
+                advance(c, m["id"], "synced" if local else "woken")
+                c.execute("UPDATE agents SET heartbeat_at=? WHERE id=? AND kind IN ('box','local')", (now(), m["to_addr"]))
                 sent += 1
-            elif n >= len(DELAYS) or (code in (401, 403, 404) and n >= 2):
+            elif n >= len(DELAYS) or code == "no-recipient" or (code in (401, 403, 404) and n >= 2):
                 advance(c, m["id"], "gave_up")
             else:
                 c.execute("UPDATE deliveries SET next_at=? WHERE msg_id=?",
@@ -1133,6 +1232,8 @@ def mcp_serve():
 # ---- CLI -------------------------------------------------------------------------------------------------------
 USAGE = """agent-bridge {v} (Mac side; store {db})
   send FROM TO [--reply-to ID] MESSAGE...   (or message on stdin)
+  send --as LOCAL --token-file PATH [--reply-to ID] TO MESSAGE...   (a local bot sending)
+  local add NAME --label LABEL --webhook URL --token-file PATH   |   local rm NAME
   deliver TOKEN...             store box tokens and wake the recipient (returns in ~2s; never executes them)
   import-token TOKEN|@FILE     import-tokens FILE|-      (same as deliver, no wake)
   inbox [ADDR] [--all]         read ID          ack ID
@@ -1216,12 +1317,29 @@ def main(argv):
         print(json.dumps(status_json(c)) if flag(a, "--json") else op_status(c))
         return 0
     if cmd == "send":
-        rt = opt(a, "--reply-to")
+        rt, who, tf = opt(a, "--reply-to"), opt(a, "--as"), opt(a, "--token-file")
+        if who is not None:   # a local bot sending: it proves itself with its own token file
+            if not is_local(who):
+                raise Fail(f"--as is only for local bots ({', '.join(sorted(LOCAL)) or 'none added'}); "
+                           f"'{who}' is not one", 3)
+            mine_tok, given = read_token(LOCAL[who]["token_file"]), read_token(tf) if tf else None
+            if not (mine_tok and given and hmac.compare_digest(mine_tok, given)):
+                raise Fail(f"--as {who} needs --token-file with {who}'s own token", 3)
+            a = [who] + a
         if len(a) < 2:
-            raise Fail("send FROM TO MESSAGE")
+            raise Fail("send FROM TO MESSAGE  |  send --as LOCAL --token-file PATH [--reply-to ID] TO MESSAGE")
         body = " ".join(a[2:]) if len(a) > 2 else sys.stdin.read()
-        print(op_send(c, a[0], a[1], body.strip(), rt)[1])
+        print(op_send(c, a[0], a[1], body.strip(), rt, as_local=who is not None)[1])
         return 0
+    if cmd == "local":
+        sub = a[0] if a else ""
+        if sub == "add" and len(a) >= 2:
+            print(op_local_add(c, a[1], opt(a, "--label"), opt(a, "--webhook"), opt(a, "--token-file")))
+            return 0
+        if sub == "rm" and len(a) >= 2:
+            print(op_local_rm(c, a[1]))
+            return 0
+        raise Fail("local add NAME --label LABEL --webhook URL --token-file PATH  |  local rm NAME")
     if cmd == "inbox":
         allm = flag(a, "--all")
         addr = next((x for x in a if not x.startswith("--")), None)
@@ -1258,8 +1376,10 @@ def main(argv):
             print(msg)
         return 0 if ok_all else 2
     if cmd == "export":
+        # Only mail for box bots goes to the box; a local bot's mail is delivered to its own webhook here.
         rows = c.execute("SELECT m.* FROM messages m JOIN deliveries d ON d.msg_id=m.id WHERE d.direction='out' "
-                         "AND d.state IN ('pending','woken','gave_up') ORDER BY m.id").fetchall()
+                         "AND d.state IN ('pending','woken','gave_up') AND NOT EXISTS (SELECT 1 FROM agents a "
+                         "WHERE a.id=m.to_addr AND a.kind='local') ORDER BY m.id").fetchall()
         seen(c, "dross")
         if rows:
             print("\n".join(token_of(m) for m in rows))

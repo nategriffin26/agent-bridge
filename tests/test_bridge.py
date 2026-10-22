@@ -24,7 +24,7 @@ class Hook(http.server.BaseHTTPRequestHandler):
         Hook.auth.append(self.headers.get("authorization"))
         if Hook.mode == "slow":
             time.sleep(20)
-        code = 200 if Hook.mode in ("ok", "slow", "trickle") else 500
+        code = 200 if Hook.mode in ("ok", "slow", "trickle") else 403 if Hook.mode == "deny" else 500
         self.send_response(code)
         self.end_headers()
         if Hook.mode == "trickle":          # each byte inside any per-read timeout, the whole answer far past it
@@ -190,6 +190,83 @@ class Bridge(unittest.TestCase):
         bad = base64.urlsafe_b64encode(json.dumps(r).encode()).decode().rstrip("=")
         self.assertEqual(self.ab("roster", bad, check=False).returncode, 2)
         self.assertEqual(self.ab("roster", self.roster([{"name": "ops"}]), check=False).returncode, 2)  # no dross
+
+    # ---- local bots (run on this Mac behind their own webhook) -----------------------------------------------------
+    def add_local(self, name="ops", secret="ops-secret"):
+        tf = Path(self.tmp.name) / f"{name}.token"
+        tf.write_text(secret + "\n")
+        self.ab("local", "add", name, "--label", name.title(), "--webhook", self.url + "/" + name, "--token-file", str(tf))
+        return tf
+
+    def test_local_bot_gets_its_own_webhook_with_plain_body_and_thread(self):
+        self.hook("http://127.0.0.1:9/box-down")                 # the box webhook is down; it must not matter
+        self.add_local()
+        me = self.register("s1")["id"]
+        first = self.call("bridge_send", me, to="dross", message="unrelated")[1].split()[1]
+        mid = self.call("bridge_send", me, to="ops", message="deploy?")[1].split()[1]
+        self.ab("_pump", AB_HTTP_TIMEOUT=2)
+        got = [b for b in Hook.bodies if b["id"] == mid]
+        self.assertEqual(len(got), 1)
+        self.assertEqual((got[0]["body"], got[0]["to"], got[0]["thread"]), ("deploy?", "ops", mid))
+        self.assertEqual(Hook.auth[Hook.bodies.index(got[0])], "Bearer ops-secret")
+        self.assertEqual(self.state(mid), "synced")
+        self.assertEqual(self.state(first), "pending")              # box mail still waits for the box
+        exported = self.ab("export").stdout.split()
+        self.assertEqual(len(exported), 1)                          # only the box mail goes to the box
+
+    def test_local_webhook_4xx_gives_up_and_timeout_retries(self):
+        self.add_local()
+        me = self.register("s1")["id"]
+        Hook.mode = "deny"
+        mid = self.call("bridge_send", me, to="ops", message="x")[1].split()[1]
+        for _ in range(2):
+            self.db().execute("UPDATE deliveries SET next_at=0 WHERE msg_id=?", (mid,)).connection.commit()
+            self.ab("_pump")
+        self.assertEqual(self.state(mid), "gave_up")
+        Hook.mode = "slow"
+        mid2 = self.call("bridge_send", me, to="ops", message="y")[1].split()[1]
+        t = time.time()
+        self.ab("_pump", AB_HTTP_TIMEOUT=1, timeout=30)
+        self.assertLess(time.time() - t, 10)
+        row = self.db().execute("SELECT state, last_code FROM deliveries WHERE msg_id=?", (mid2,)).fetchone()
+        self.assertEqual(row["state"], "pending")                  # a hung bot is retried, not dropped
+        self.assertIn(row["last_code"], ("timeout", "net-error"))
+
+    def test_local_bot_sends_with_its_token_and_reads_as_the_owner(self):
+        tf = self.add_local()
+        me = self.register("s1")["id"]
+        q = self.call("bridge_send", me, to="ops", message="status?")[1].split()[1]
+        bad = Path(self.tmp.name) / "wrong.token"
+        bad.write_text("guess")
+        self.assertEqual(self.ab("send", "--as", "ops", "--token-file", str(bad), me, "hi", check=False).returncode, 3)
+        self.assertEqual(self.ab("send", "--as", "ops", me, "hi", check=False).returncode, 3)
+        self.assertEqual(self.ab("send", "--as", "dross", "--token-file", str(tf), me, "hi", check=False).returncode, 3)
+        self.assertEqual(self.ab("send", "--as", me, "--token-file", str(tf), "ops", "hi", check=False).returncode, 3)
+        self.assertNotEqual(self.ab("send", "ops", me, "forged", check=False).returncode, 0)   # no --as: not ops
+        r = self.ab("send", "--as", "ops", "--token-file", str(tf), "--reply-to", q, me, "all green")
+        rid = r.stdout.split()[1]
+        out = self.call("bridge_read", me, id=rid)[1]
+        self.assertIn("a local bot), acting for Ada; token verified", out)
+        self.assertIn(f"thread={q}", out)
+
+    def test_moved_desk_stays_local_and_the_box_cannot_impersonate_it(self):
+        self.ab("roster", self.roster([{"name": "dross"}, {"name": "scout", "label": "Scout"}]))
+        tf = Path(self.tmp.name) / "scout.token"
+        tf.write_text("s3cret")
+        out = self.ab("local", "add", "scout", "--webhook", self.url, "--token-file", str(tf)).stdout
+        self.assertIn("box bot of that name archived", out)
+        self.assertNotIn("s3cret", out)
+        out = self.ab("roster", self.roster([{"name": "dross"}, {"name": "scout", "label": "Scout"}])).stdout
+        self.assertIn("kept local: scout", out)
+        kinds = {a["id"]: a["kind"] for a in json.loads(self.ab("agents", "--json").stdout)}
+        self.assertEqual(kinds["scout"], "local")
+        self.register("s1")
+        tok = self.v1("send", "scout", "omp/e2e", "box claiming to be scout").split("deliver ")[1].split()[0]
+        r = self.ab("deliver", tok, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("address not allowed", r.stdout + r.stderr)
+        self.ab("local", "rm", "scout")
+        self.assertNotIn("scout", self.ab("agents", "--json").stdout)
 
     def test_reads_ride_out_a_brief_lock(self):
         """status/messages/agents crashed with 'database is locked' when a read met a writer's checkpoint."""
