@@ -1240,7 +1240,7 @@ USAGE = """agent-bridge {v} (Mac side; store {db})
   export                       outbound tokens the box has not confirmed (for the sweep)
   received-ids [--days N]      ids received from the box recently (for the box's 'mark')
   export-acks [--days N]       JSON lines: state of messages received from the box (queued/notified/read/acked)
-  policy                       JSON {version, text}: the bridge policy omp sessions keep in context
+  policy                       JSON {{version, text}}: the bridge policy omp sessions keep in context
   roster TOKEN|-               apply the box's signed bot roster (box/make-roster-token.py); retired bots are archived
   mark delivered|synced|read|acked ID...   box confirms outbound messages
   agents [--all|--stale|--exited] [--json] [NAME]    whoami     messages [--json] [--addr A] [--limit N]

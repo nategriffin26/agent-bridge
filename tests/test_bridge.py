@@ -268,6 +268,11 @@ class Bridge(unittest.TestCase):
         self.ab("local", "rm", "scout")
         self.assertNotIn("scout", self.ab("agents", "--json").stdout)
 
+    def test_help_prints_usage(self):
+        """A literal brace in USAGE (it goes through str.format) crashed --help with a KeyError."""
+        for flag in ("--help", "help"):
+            self.assertIn("local add NAME", self.ab(flag).stdout)
+
     def test_reads_ride_out_a_brief_lock(self):
         """status/messages/agents crashed with 'database is locked' when a read met a writer's checkpoint."""
         hold = sqlite3.connect(str(self.mac / "v2" / "bridge.db"), isolation_level=None, check_same_thread=False)
