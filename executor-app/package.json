@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "apps": "0.0.1-beta.34",
+    "apps": "0.0.1-beta.101",
     "@modelcontextprotocol/sdk": "1.32.1"
   }
 }

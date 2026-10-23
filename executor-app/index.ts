@@ -5,10 +5,13 @@ import { never } from 'apps/operations/approval';
 // agent-bridge's stdio MCP server (~/bin/agent-bridge mcp), exposed over HTTP by the Context local MCP gateway (port 4313).
 const url = 'http://127.0.0.1:4313/mcp/agent_bridge';
 const headers = (account: { fields: { token: string } }) => ({ Authorization: 'Bearer ' + account.fields.token });
+// The provider's name, hosts and fields are its identity: Executor's saved bridge account belongs to exactly this
+// definition. The key is 64 characters; since apps beta.95 a string's JSON Schema minLength is half the declared
+// length, so 64 here writes the same definition (minLength 32) the account was saved under.
 const service = defineProvider({
   name: 'Context Local MCP',
   hosts: ['127.0.0.1:4313'],
-  auth: { apiKey: secrets({ label: 'Local MCP bridge key', fields: object({ token: string({ minLength: 32 }) }) }) },
+  auth: { apiKey: secrets({ label: 'Local MCP bridge key', fields: object({ token: string({ minLength: 64 }) }) }) },
   health: (check) => mcpHealth(check, { url, headers: headers(check.account) }),
 });
 
@@ -51,12 +54,11 @@ do it by default and report back with bridge_reply. Check with the owner first o
 deleting, credentials or secrets, or anything touching other people.
 `;
 
-// The provider matches other apps served by the same local MCP gateway (apps 0.0.1-beta.34), so an Executor
-// account that already holds the gateway key links here unchanged.
-export default defineApp({ accounts: { service } }, async ({ accounts, signal, cache }) => ({
+// The factory also runs without a caller (app-scope work), which has no bridge account and so no tools.
+export default defineApp({ user: { accounts: { service } } }, async ({ user, signal, cache }) => ({
   tools: router(
     // Messages go agent to agent and send nothing as the owner, so no tool asks.
-    withApprovals(await mcpRouter({ url, account: accounts.service, headers: headers(accounts.service), signal, cache }), () => never()),
+    user ? withApprovals(await mcpRouter({ url, account: user.accounts.service, headers: headers(user.accounts.service), signal, cache }), () => never()) : router({}),
     { title: 'Agent Bridge', description, instructions },
   ),
 }));
