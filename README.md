@@ -26,7 +26,7 @@ flowchart LR
 
 ## Why
 
-Driving agents by typing into their terminal panes is fragile: a pane in copy mode swallows keys, a busy pane queues them, and nothing records whether a message was seen. This replaces that with a store that tracks each message through `queued → notified → read → acked`, delivery that is at least once, and a wake that goes through omp's own extension API.
+Driving agents by typing into their tmux panes is fragile: a pane in copy mode swallows keys, a busy pane queues them, and nothing records whether a message was seen. This replaces that with a store that tracks each message through `queued → notified → read → acked`, delivery that is at least once, and a wake that goes through omp's own extension API.
 
 ## Trust model
 
@@ -37,7 +37,7 @@ Driving agents by typing into their terminal panes is fragile: a pane in copy mo
 
 ## Quickstart (Mac)
 
-Requires Python 3.9+ and omp. herdr is optional: it names agents and powers the last-resort nudge.
+Requires Python 3.9+, omp, and tmux (optional).
 
 ```sh
 git clone https://github.com/nategriffin26/agent-bridge && cd agent-bridge
@@ -89,23 +89,23 @@ agent-bridge local rm ops
 
 ## Architecture
 
-- **One file, stdlib only.** `src/agent_bridge.py` is the store, CLI, stdio MCP server, webhook pump and herdr fallback. One owner of all state.
+- **One file, stdlib only.** `src/agent_bridge.py` is the store, CLI, stdio MCP server, webhook pump and tmux fallback. One owner of all state.
 - **Store.** SQLite in WAL mode at `~/.agent-bridge/v2/bridge.db`: `agents`, `agents_archive`, `messages`, `deliveries` (one row per message: state and timestamps), `events`, `meta`. Every statement retries a briefly locked store for up to 1.5 s, then exits 4; nothing hangs.
-- **Identity.** `omp/<label>-<4 hex>`, where the label is `AB_SELF`, else the herdr workspace name (or tmux session), else the folder, and the suffix comes from the omp session id, so `/reload` and `/resume` keep it. That workspace name is an alias that resolves to the one live agent carrying it. Each registration also records where the session lives (`herdr_pane`, `herdr_workspace`, or `tmux_pane`), and `bridge_list_agents` shows it. Heartbeats every 30 s; `stale` after 120 s or a dead pid; `exited` on shutdown. The pump archives exited rows after an hour and stale rows after a day.
+- **Identity.** `omp/<label>-<4 hex>`, where the label is `AB_SELF`, else the tmux session, else the folder, and the suffix comes from the omp session id, so `/reload` and `/resume` keep it. The tmux session name is an alias that resolves to the one live agent carrying it. Heartbeats every 30 s; `stale` after 120 s or a dead pid; `exited` on shutdown. The pump archives exited rows after an hour and stale rows after a day.
 - **Wake.** The extension watches a per-agent notify file and asks the CLI for new mail. Idle sessions get a turn; busy ones get the pointer at the next step boundary. It never injects the message body.
 - **Hot reload.** `extension/agent-bridge.ts` is a stable shim with fixed hooks and tools. It re-imports `extension/bridge-runtime.ts` whenever that file changes, so behavior updates reach running sessions within 3 s. The policy agents follow comes from `agent-bridge policy`; when its version changes, running sessions get the new text in context.
 - **Mac → box.** Sends are stored first. A detached pump POSTs `{agent_bridge:1, id, from, to, token}` to the webhook with backoff (5 s to 10 min) and an absolute 15 s cap per attempt; launchd retries stranded rows every minute. If the webhook is down, the box sweep still pulls with `export`.
-- **herdr, last resort.** For sessions without the extension, opt in with `touch ~/.agent-bridge/inject/<name>`: it prompts the herdr agent of that name (or the registered pane), typing a one-line pointer, and the call is capped at 2 s.
+- **tmux, last resort.** For sessions without the extension, opt in with `touch ~/.agent-bridge/inject/<name>`: it leaves copy mode, targets the exact pane, types a one-line pointer, and every call is capped at 2 s.
 - **Executor.** `executor-app/` exposes the MCP server through an [Executor](https://executor.sh) local gateway; callers pass `me`.
 
 ## Tests
 
 ```sh
 python3 -m unittest discover -s tests     # about 20 s
-python3 tests/e2e.py [--model M]          # a real omp worker in a throwaway herdr workspace
+python3 tests/e2e.py [--model M]          # a real omp worker in a throwaway tmux session
 ```
 
-The unit tests run the real CLI against throwaway homes, with the v1 box code on the other side. They cover signing, dedupe, at-least-once redelivery, aliases, herdr placement and the nudge (with a fake herdr), the roster, pruning, the webhook (down, slow, trickling), and a locked store.
+The unit tests run the real CLI against throwaway homes, with the v1 box code on the other side. They cover signing, dedupe, at-least-once redelivery, aliases, the roster, pruning, the webhook (down, slow, trickling), the tmux fallback with a fake tmux, and a locked store.
 
 ## License
 

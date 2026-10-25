@@ -10,13 +10,13 @@ messages (signed bodies), deliveries (one per message: its state and timestamps)
 Every message is HMAC-signed with the v1 shared secret over the v1 canonical fields, so it can still travel as a v1 token.
 Received text is never executed. Secrets are never printed. Every subprocess and network call has a timeout.
 """
-import base64, hashlib, hmac, json, os, random, re, secrets, shutil, socket, sqlite3, subprocess, sys, threading, time
+import base64, hashlib, hmac, json, os, random, re, secrets, socket, sqlite3, subprocess, sys, threading, time
 import urllib.error, urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
 VERSION = "2.0.0"
-SCHEMA = 3
+SCHEMA = 2
 MAX_BODY = 32 * 1024
 BOX = set()                            # box agent addresses (e.g. Grok bots), loaded from the store; the box's roster sets it
 LOCAL = {}                             # local bot address -> {webhook, token_file}, set with `agent-bridge local add`
@@ -28,7 +28,7 @@ DELAYS = [5, 15, 45, 120, 300, 600]   # webhook retry backoff (seconds) after ea
 STALE_AFTER = 120                      # seconds without a heartbeat before an agent counts as stale
 RENOTIFY_AFTER = 900                   # an unread, notified message is pointed out again after this long ...
 MAX_NOTIFY = 3                         # ... at most this many times in all
-NUDGE_GAP = 30                         # at most one herdr nudge per target per this many seconds
+NUDGE_GAP = 30                         # at most one tmux nudge per pane per this many seconds
 PREFIX = "[agent-bridge] From agent {frm}"
 HOST = socket.gethostname()
 
@@ -56,7 +56,6 @@ BUSY_S = float(os.environ.get("AB_BUSY_MS") or 1500) / 1000          # how long 
 HTTP_S = min(float(os.environ.get("AB_HTTP_TIMEOUT") or 15), 15.0)    # hard cap per webhook attempt
 TMUX_S = min(float(os.environ.get("AB_TMUX_TIMEOUT") or 2), 2.0)      # hard cap per tmux call
 TMUX = os.environ.get("AB_TMUX") or "tmux"
-HERDR_S = min(float(os.environ.get("AB_HERDR_TIMEOUT") or 2), 2.0)    # hard cap per herdr call
 
 
 class Fail(Exception):
@@ -187,7 +186,7 @@ CREATE TABLE IF NOT EXISTS agents(
   id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'omp', label TEXT, aliases TEXT NOT NULL DEFAULT '[]',
   cwd TEXT, repo TEXT, branch TEXT, model TEXT, provider TEXT, tmux_target TEXT, tmux_pane TEXT,
   pid INTEGER, host TEXT, session_id TEXT, session_file TEXT, started_at REAL, heartbeat_at REAL,
-  state TEXT, exit_reason TEXT, ext_version TEXT, webhook TEXT, token_file TEXT, herdr_pane TEXT, herdr_workspace TEXT);
+  state TEXT, exit_reason TEXT, ext_version TEXT, webhook TEXT, token_file TEXT);
 CREATE TABLE IF NOT EXISTS agents_archive(id TEXT NOT NULL, archived_at REAL NOT NULL, row TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY, from_addr TEXT NOT NULL, to_addr TEXT NOT NULL, rcpt TEXT, ts INTEGER NOT NULL,
@@ -236,13 +235,12 @@ def connect():
         if c.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
             c.execute("PRAGMA journal_mode=WAL")
         with tx(c):
+            if version == 1:   # v1 -> v2: local agents keep their webhook and the path of their token file
+                c.execute("ALTER TABLE agents ADD COLUMN webhook TEXT")
+                c.execute("ALTER TABLE agents ADD COLUMN token_file TEXT")
             for stmt in DDL.split(";"):
                 if stmt.strip():
                     c.execute(stmt)
-            have = {r["name"] for r in c.execute("PRAGMA table_info(agents)")}   # older stores lack the later columns
-            for col in ("webhook", "token_file", "herdr_pane", "herdr_workspace"):
-                if col not in have:
-                    c.execute(f"ALTER TABLE agents ADD COLUMN {col} TEXT")
             c.execute("INSERT OR IGNORE INTO agents(id, kind, label, state) VALUES('dross', 'box', 'Dross', 'remote')")
             c.execute(f"PRAGMA user_version={SCHEMA}")
     c.execute("PRAGMA synchronous=FULL")
@@ -347,7 +345,7 @@ def notify_file(addr):
 
 
 def maybe_nudge(to, mid):
-    """Only sessions that opted in to the herdr nudge (~/.agent-bridge/inject/<name>) get a detached nudge process."""
+    """Only sessions that opted in to the tmux nudge (~/.agent-bridge/inject/<name>) get a detached nudge process."""
     if is_omp(to) and (H / "inject" / to[4:]).exists():
         spawn("_notify", mid)
 
@@ -616,20 +614,6 @@ def tmux_info(pane):
     return s, f"{s}:{w}.{p}"
 
 
-def herdr_binary():
-    return os.environ.get("AB_HERDR") or shutil.which("herdr") or str(Path.home() / ".local" / "bin" / "herdr")
-
-
-def herdr_label(workspace_id):
-    """The herdr workspace's name, or None when herdr is unreachable or the name has nothing to label an agent with."""
-    out = run([herdr_binary(), "workspace", "get", workspace_id], HERDR_S)
-    try:
-        label = json.loads(out)["result"]["workspace"]["label"] or ""
-    except Exception:
-        return None
-    return label if re.search(r"[A-Za-z0-9]", label) else None
-
-
 def op_register(c, meta):
     """Register (or refresh) an omp session. Identity is computed here, in one place."""
     sid = str(meta.get("session_id") or "")
@@ -638,9 +622,6 @@ def op_register(c, meta):
     cwd = str(meta.get("cwd") or os.getcwd())
     pane = meta.get("tmux_pane") or None
     tmux_session, target = tmux_info(pane) if pane and meta.get("tmux") else (None, None)
-    herdr_pane = meta.get("herdr_pane") or None
-    herdr_ws = herdr_label(meta["herdr_workspace"]) if herdr_pane and meta.get("herdr_workspace") else None
-    session = herdr_ws or tmux_session      # the persistent unit the owner named: a herdr workspace or a tmux session
     ab_self = (meta.get("ab_self") or "").strip()
     if ab_self:
         aid = as_addr(ab_self)
@@ -648,10 +629,10 @@ def op_register(c, meta):
             raise Fail(f"AB_SELF '{ab_self}' is not a valid omp address")
         label = aid[4:]
     else:
-        label = clean_label(session or os.path.basename(cwd.rstrip("/")))
+        label = clean_label(tmux_session or os.path.basename(cwd.rstrip("/")))
         aid = f"omp/{label}-{hashlib.sha256(sid.encode()).hexdigest()[:4]}"
     aliases = []
-    for a in ([f"omp/{clean_label(session)}"] if session else []) + [f"omp/{label}"]:
+    for a in ([f"omp/{clean_label(tmux_session)}"] if tmux_session else []) + [f"omp/{label}"]:
         if a != aid and is_omp(a) and a not in aliases:
             aliases.append(a)
     top = run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], 1.5)
@@ -662,14 +643,14 @@ def op_register(c, meta):
         same = old and old["session_id"] == sid and old["pid"] == meta.get("pid") and old["state"] != "exited"
         c.execute("INSERT OR REPLACE INTO agents(id, kind, label, aliases, cwd, repo, branch, model, provider, tmux_target,"
                   " tmux_pane, pid, host, session_id, session_file, started_at, heartbeat_at, state, exit_reason,"
-                  " ext_version, herdr_pane, herdr_workspace) VALUES(?, 'omp', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, NULL, ?,?,?)",
+                  " ext_version) VALUES(?, 'omp', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, NULL, ?)",
                   (aid, label, json.dumps(aliases), cwd, top.strip() if top else None,
                    branch.strip() if branch else None, meta.get("model"), meta.get("provider"), target, pane,
                    meta.get("pid"), HOST, sid, meta.get("session_file"), old["started_at"] if same else t, t,
-                   meta.get("state") or "idle", meta.get("ext_version"), herdr_pane, herdr_ws))
+                   meta.get("state") or "idle", meta.get("ext_version")))
         event(c, "register", agent=aid, pid=meta.get("pid"), refresh=bool(same))
         release_alias_mail(c, aliases)   # a crashed predecessor never exited cleanly; its alias mail comes here
-    return {"id": aid, "aliases": aliases, "tmux_target": target, "herdr_pane": herdr_pane, "herdr_workspace": herdr_ws}
+    return {"id": aid, "aliases": aliases, "tmux_target": target}
 
 
 def op_heartbeat(c, aid, state=None, model=None, provider=None, ext=None):
@@ -745,8 +726,6 @@ def fmt_agents(rows):
             bits.append(f"{a['provider']}/{a['model']}" if a["provider"] else a["model"])
         if a["tmux_target"]:
             bits.append(f"tmux {a['tmux_target']}")
-        if a["herdr_pane"]:
-            bits.append(f"herdr {a['herdr_workspace'] + ' ' if a['herdr_workspace'] else ''}{a['herdr_pane']}")
         if a["cwd"]:
             bits.append(a["cwd"].replace(str(Path.home()), "~"))
         if a["unread"]:
@@ -993,9 +972,13 @@ def op_pump(c, budget=45.0):
     return sent
 
 
-# ---- herdr last-resort nudge (opt-in via ~/.agent-bridge/inject/<name>) ----------------------------------------
+# ---- tmux last-resort nudge (opt-in via ~/.agent-bridge/inject/<name>) -----------------------------------------
+def tmux(*args):
+    return run([TMUX] + list(args), TMUX_S)
+
+
 def nudge(c, mid):
-    """For sessions without the extension only. Never types the body; the herdr call is bounded by HERDR_S."""
+    """For sessions without the extension only. Never types the body; every tmux call is bounded by TMUX_S."""
     m = c.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
     if not m:
         return "no such message"
@@ -1005,15 +988,28 @@ def nudge(c, mid):
     name = m["to_addr"][4:]
     if not (H / "inject" / name).exists():
         return "no inject opt-in"
-    target = r["herdr_pane"] if r and r["herdr_pane"] else name     # herdr agent names equal workspace labels
-    last = c.execute("SELECT max(t) FROM events WHERE ev='nudge' AND agent=?", (target,)).fetchone()[0]
+    pane = r["tmux_pane"] if r and r["tmux_pane"] else None
+    if not pane:
+        out = tmux("list-panes", "-t", f"={name}:", "-F", "#{pane_active}\t#{pane_id}")
+        if out is None:
+            return f"no tmux session {name}"
+        pane = next((l.split("\t")[1] for l in out.splitlines() if l.startswith("1\t")), None)
+        if not pane:
+            return "no active pane"
+    last = c.execute("SELECT max(t) FROM events WHERE ev='nudge' AND agent=?", (pane,)).fetchone()[0]
     if last and now() - last < NUDGE_GAP:
         return "nudged recently"
+    mode = tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}")
+    if mode is None:
+        return "tmux unavailable"
+    if mode.strip() == "1" and tmux("send-keys", "-t", pane, "-X", "cancel") is None:
+        return "could not leave copy mode"
     line = f"[agent-bridge] You have a new bridge message from {m['from_addr']}. Run bridge_inbox."
-    if run([herdr_binary(), "agent", "prompt", target, line], HERDR_S) is None:
-        return f"no herdr agent {target} to nudge"
+    if tmux("send-keys", "-t", pane, "-l", line) is None:
+        return "typing failed"
+    tmux("send-keys", "-t", pane, "Enter")
     with tx(c):
-        event(c, "nudge", mid, target)
+        event(c, "nudge", mid, pane)
     return "nudged"
 
 
