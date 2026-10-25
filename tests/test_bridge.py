@@ -1,4 +1,4 @@
-"""agent-bridge v2: store, signing, webhook pump, tmux nudge, and the timeouts that keep everything from hanging.
+"""agent-bridge v2: store, signing, webhook pump, herdr nudge, and the timeouts that keep everything from hanging.
 
 Run: python3 -m unittest discover -s tests -v
 Each test runs the real CLI against throwaway homes; the box side is the pinned v1 file (tests/v1), which is what the
@@ -11,6 +11,7 @@ REPO = Path(__file__).resolve().parent.parent
 CLI = REPO / "src" / "agent_bridge.py"
 V1 = REPO / "tests" / "v1" / "agent-bridge-v1.py"
 FAKE_TMUX = REPO / "tests" / "fake_tmux.py"
+FAKE_HERDR = REPO / "tests" / "fake_herdr.py"
 SECRET = "test-secret-" + "x" * 40
 
 
@@ -64,6 +65,7 @@ class Bridge(unittest.TestCase):
             (home / "secret").write_text(SECRET)
             os.chmod(home / "secret", 0o600)
         self.tlog = root / "tmux.log"
+        self.hlog = root / "herdr.log"
         Hook.mode, Hook.bodies, Hook.auth = "ok", [], []
         self.ab("init", "--side", "mac")
 
@@ -74,7 +76,8 @@ class Bridge(unittest.TestCase):
 
     def env(self, **extra):
         e = {k: v for k, v in os.environ.items() if not k.startswith(("AB_", "TMUX"))}
-        e.update(AB_HOME=str(self.mac), AB_NO_SPAWN="1", AB_TMUX=str(FAKE_TMUX), FAKE_TMUX_LOG=str(self.tlog))
+        e.update(AB_HOME=str(self.mac), AB_NO_SPAWN="1", AB_TMUX=str(FAKE_TMUX), FAKE_TMUX_LOG=str(self.tlog),
+                 AB_HERDR=str(FAKE_HERDR), FAKE_HERDR_LOG=str(self.hlog))
         e.update({k: str(v) for k, v in extra.items()})
         return e
 
@@ -97,9 +100,9 @@ class Bridge(unittest.TestCase):
         out = self.v1("send", "dross", to, *(["--reply-to", reply_to] if reply_to else []), body)
         return out.split("deliver ")[1].split()[0]
 
-    def register(self, session_id="sess-1", cwd="/tmp/proj", pid=None, **meta):
+    def register(self, session_id="sess-1", cwd="/tmp/proj", pid=None, env=None, **meta):
         meta = {"session_id": session_id, "cwd": cwd, "pid": pid or self.sleeper.pid, "ext_version": "test", **meta}
-        return json.loads(self.ab("register", input=json.dumps(meta)).stdout)
+        return json.loads(self.ab("register", input=json.dumps(meta), **(env or {})).stdout)
 
     def db(self):
         if not getattr(self, "_db", None):
@@ -124,6 +127,53 @@ class Bridge(unittest.TestCase):
         t = self.register("abc", tmux="/tmp/sock", tmux_pane="%5")
         self.assertRegex(t["id"], r"^omp/e2e-[0-9a-f]{4}$")
         self.assertEqual((t["tmux_target"], t["aliases"]), ("e2e:0.1", ["omp/e2e"]))
+
+    # ---- herdr placement ---------------------------------------------------------------------------------------
+    def herdr_calls(self):
+        return [json.loads(l) for l in self.hlog.read_text().splitlines()] if self.hlog.exists() else []
+
+    def test_herdr_workspace_names_the_agent_the_way_a_tmux_session_did(self):
+        a = self.register("abc", cwd="/Users/x/dross", herdr_pane="w7:p1", herdr_workspace="w7")
+        self.assertRegex(a["id"], r"^omp/vault-[0-9a-f]{4}$")
+        self.assertEqual((a["aliases"], a["herdr_pane"], a["herdr_workspace"]), (["omp/vault"], "w7:p1", "vault"))
+        self.assertEqual(self.herdr_calls(), [["workspace", "get", "w7"]])
+        row = json.loads(self.ab("agents", "--json").stdout)
+        mine = next(r for r in row if r["id"] == a["id"])
+        self.assertEqual((mine["herdr_pane"], mine["herdr_workspace"]), ("w7:p1", "vault"))
+        self.assertIn("herdr vault w7:p1", self.ab("agents").stdout)
+        # two sessions in one cwd stay apart by workspace, which is why vault and mail can share a folder
+        b = self.register("def", cwd="/Users/x/dross", herdr_pane="w9:p1", herdr_workspace="w9",
+                          env={"FAKE_HERDR_LABEL": "mail"})
+        self.assertEqual(b["aliases"], ["omp/mail"])
+
+    def test_herdr_label_loses_to_ab_self_and_to_nothing_nameable(self):
+        self.assertEqual(self.register("abc", ab_self="omp/bridge2", herdr_pane="w7:p1", herdr_workspace="w7")["id"],
+                         "omp/bridge2")
+        a = self.register("abc", cwd="/Users/x/proj", herdr_pane="w1:p1", herdr_workspace="w1",
+                          env={"FAKE_HERDR_LABEL": "~"})      # an unnamed workspace is called by its folder: no label
+        self.assertRegex(a["id"], r"^omp/proj-[0-9a-f]{4}$")
+        self.assertEqual(a["herdr_workspace"], None)
+        self.assertEqual(a["herdr_pane"], "w1:p1")
+
+    def test_no_herdr_call_outside_herdr_and_a_hung_herdr_is_cut_off(self):
+        self.register("abc", cwd="/Users/x/proj")
+        self.assertEqual(self.herdr_calls(), [])
+        t0 = time.time()
+        a = self.register("abc", cwd="/Users/x/proj", herdr_pane="w7:p1", herdr_workspace="w7",
+                          env={"FAKE_HERDR_HANG": 1})
+        self.assertLess(time.time() - t0, 3.5)
+        self.assertRegex(a["id"], r"^omp/proj-[0-9a-f]{4}$")
+
+    def test_a_store_from_before_herdr_keeps_its_agents_and_gains_the_columns(self):
+        old = self.register("abc", cwd="/Users/x/proj")
+        self.db().execute("ALTER TABLE agents DROP COLUMN herdr_pane").connection.commit()
+        self.db().execute("ALTER TABLE agents DROP COLUMN herdr_workspace").connection.commit()
+        self.db().execute("PRAGMA user_version=2").connection.commit()
+        rows = json.loads(self.ab("agents", "--json").stdout)
+        mine = next(r for r in rows if r["id"] == old["id"])
+        self.assertEqual((mine["cwd"], mine["herdr_pane"]), ("/Users/x/proj", None))
+        self.assertEqual(self.register("abc", cwd="/Users/x/proj", herdr_pane="w2:p1", herdr_workspace="w2")["herdr_pane"],
+                         "w2:p1")
 
     def test_stale_when_heartbeat_old_or_pid_dead_and_exited_on_quit(self):
         live = self.register("s1")["id"]
@@ -495,23 +545,30 @@ class Bridge(unittest.TestCase):
         self.assertLess(time.time() - t0, 5)
         self.assertEqual(self.state(mid), "pending")
         code = subprocess.run([sys.executable, "-c", f"import os;os.environ['AB_HTTP_TIMEOUT']='999';"
+                               f"os.environ['AB_HERDR_TIMEOUT']='999';"
                                f"import importlib.util as u;s=u.spec_from_file_location('ab','{CLI}');m=u.module_from_spec(s);"
-                               f"s.loader.exec_module(m);print(m.HTTP_S, m.TMUX_S)"], capture_output=True, text=True)
+                               f"s.loader.exec_module(m);print(m.HTTP_S, m.HERDR_S)"], capture_output=True, text=True)
         self.assertEqual(code.stdout.split(), ["15.0", "2.0"])                    # hard caps hold whatever env says
 
-    # ---- the tmux last-resort nudge ---------------------------------------------------------------------------
-    def test_nudge_leaves_copy_mode_targets_pane_and_types_only_a_pointer(self):
+    # ---- the herdr last-resort nudge --------------------------------------------------------------------------
+    def test_nudge_prompts_the_named_agent_and_types_only_a_pointer(self):
         (self.mac / "inject" / "legacy").touch()
         mid = self.ab("deliver", self.box_token("omp/legacy", "SECRET BODY")).stdout.split()[1]
-        r = self.ab("_notify", mid, AB_DEBUG=1, FAKE_TMUX_MODE=1)
+        r = self.ab("_notify", mid, AB_DEBUG=1)
         self.assertEqual(r.stdout.strip(), "nudged")
-        calls = [json.loads(l) for l in self.tlog.read_text().splitlines()]
-        self.assertEqual(calls[0][:3], ["list-panes", "-t", "=legacy:"])
-        self.assertEqual(calls[2], ["send-keys", "-t", "%9", "-X", "cancel"])
-        self.assertEqual(calls[3][:4], ["send-keys", "-t", "%9", "-l"])
-        self.assertNotIn("SECRET BODY", calls[3][4])
-        self.assertEqual(calls[4], ["send-keys", "-t", "%9", "Enter"])
+        (call,) = self.herdr_calls()
+        self.assertEqual(call[:3], ["agent", "prompt", "legacy"])
+        self.assertNotIn("SECRET BODY", call[3])
+        self.assertIn("bridge_inbox", call[3])
         self.assertEqual(self.ab("_notify", mid, AB_DEBUG=1).stdout.strip(), "nudged recently")
+        self.assertEqual(len(self.herdr_calls()), 1)
+
+    def test_nudge_targets_the_registered_pane_when_there_is_one(self):
+        a = self.register("s1", ext_version=None, herdr_pane="w3:p2", herdr_workspace="w3")
+        (self.mac / "inject" / a["id"][4:]).touch()
+        mid = self.ab("deliver", self.box_token(a["id"])).stdout.split()[1]
+        self.assertEqual(self.ab("_notify", mid, AB_DEBUG=1).stdout.strip(), "nudged")
+        self.assertEqual(self.herdr_calls()[-1][:3], ["agent", "prompt", "w3:p2"])
 
     def test_nudge_skips_extension_agents_and_sessions_without_opt_in(self):
         me = self.register("s1")["id"]
@@ -520,17 +577,26 @@ class Bridge(unittest.TestCase):
         self.assertEqual(self.ab("_notify", mid, AB_DEBUG=1).stdout.strip(), "extension wakes it")
         mid = self.ab("deliver", self.box_token("omp/plain")).stdout.split()[1]
         self.assertEqual(self.ab("_notify", mid, AB_DEBUG=1).stdout.strip(), "no inject opt-in")
-        self.assertFalse(self.tlog.exists())
+        self.assertEqual(self.herdr_calls(), [])
 
-    def test_hung_tmux_is_cut_off(self):
+    def test_a_failed_nudge_says_so_and_is_retried(self):
+        (self.mac / "inject" / "legacy").touch()
+        mid = self.ab("deliver", self.box_token("omp/legacy")).stdout.split()[1]
+        r = self.ab("_notify", mid, AB_DEBUG=1, FAKE_HERDR_FAIL=1)
+        self.assertEqual(r.stdout.strip(), "no herdr agent legacy to nudge")
+        self.assertEqual(self.ab("_notify", mid, AB_DEBUG=1).stdout.strip(), "nudged")   # failure left no 'recent' mark
+
+    def test_hung_herdr_nudge_is_cut_off(self):
         (self.mac / "inject" / "legacy").touch()
         mid = self.ab("deliver", self.box_token("omp/legacy")).stdout.split()[1]
         t0 = time.time()
-        r = self.ab("_notify", mid, AB_DEBUG=1, FAKE_TMUX_HANG=1)
+        r = self.ab("_notify", mid, AB_DEBUG=1, FAKE_HERDR_HANG=1)
         self.assertLess(time.time() - t0, 3.5)
-        self.assertEqual(r.stdout.strip(), "no tmux session legacy")
+        self.assertEqual(r.stdout.strip(), "no herdr agent legacy to nudge")
+
+    def test_registration_survives_a_hung_tmux(self):
         t0 = time.time()
-        self.register("s9", tmux="/tmp/sock", tmux_pane="%5", **{})               # registration survives a hung tmux too
+        self.register("s9", tmux="/tmp/sock", tmux_pane="%5", env={"FAKE_TMUX_HANG": 1})
         self.assertLess(time.time() - t0, 3.5)
 
     # ---- a locked store ---------------------------------------------------------------------------------------

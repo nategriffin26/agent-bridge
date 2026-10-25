@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""End-to-end: a fresh omp worker that Dross did not start (no AB_SELF), in a throwaway tmux session `ab2-e2e`.
+"""End-to-end: a fresh omp worker that Dross did not start (no AB_SELF), in a throwaway herdr workspace `ab2-e2e`.
 
   python3 tests/e2e.py [--model anthropic/claude-sonnet-5-5] [--installed]
 
 It must auto-register; a box-signed token from dross (made by the v1 box code) is delivered with the Mac CLI; the
-extension must wake the worker (no tmux typing: there is no inject opt-in); the worker reads and replies; the reply
+extension must wake the worker (no typing into the pane: there is no inject opt-in); the worker reads and replies; the reply
 must land addressed to dross and the webhook (a local mock, never the real one) must be attempted.
 Everything runs against a throwaway AB_HOME. --installed uses ~/bin/agent-bridge and the extension omp discovers
 on its own; the default passes the repo's CLI and extension explicitly. Prints timings as JSON at the end.
@@ -15,6 +15,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 ROOT = Path("/tmp/ab2-e2e")
 SESSION = "ab2-e2e"
+HERDR = shutil.which("herdr") or str(Path.home() / ".local" / "bin" / "herdr")
+WS = PANE = None
 MODEL = sys.argv[sys.argv.index("--model") + 1] if "--model" in sys.argv else "anthropic/claude-sonnet-5-5"
 INSTALLED = "--installed" in sys.argv
 CLI = str(Path.home() / "bin" / "agent-bridge") if INSTALLED else str(REPO / "src" / "agent_bridge.py")
@@ -50,12 +52,18 @@ def wait(what, fn, timeout):
 
 
 def pane():
-    return sh("tmux", "capture-pane", "-p", "-t", f"={SESSION}:", "-S", "-60", check=False, timeout=2)
+    return sh(HERDR, "pane", "read", PANE, "--source", "recent", "--lines", "60", check=False, timeout=5) if PANE else ""
+
+
+def close_workspace():
+    if WS:
+        subprocess.run([HERDR, "workspace", "close", WS], capture_output=True, timeout=5)
 
 
 def main():
-    if subprocess.run(["tmux", "has-session", "-t", f"={SESSION}"], capture_output=True, timeout=2).returncode == 0:
-        raise SystemExit(f"tmux session {SESSION} already exists; stop it first")
+    global WS, PANE
+    if SESSION in [w["label"] for w in json.loads(sh(HERDR, "workspace", "list"))["result"]["workspaces"]]:
+        raise SystemExit(f"herdr workspace {SESSION} already exists; close it first")
     if ROOT.exists():
         ROOT.rename(ROOT.with_name(f"ab2-e2e.prev-{int(time.time())}"))
     mac, box, work = ROOT / "home", ROOT / "box", ROOT / SESSION
@@ -70,7 +78,7 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     (mac / "webhook.env").write_text(f"AB_WEBHOOK_URL=http://127.0.0.1:{srv.server_address[1]}/hook\n")
 
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("AB_", "TMUX"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AB_")}
     menv = {**env, "AB_HOME": str(mac)}
     ab = lambda *a, **k: sh(CLI, *a, env=menv, **k)
     ab("init", "--side", "mac")
@@ -80,13 +88,16 @@ def main():
     if not INSTALLED:
         launch += f" -e {REPO / 'extension' / 'agent-bridge.ts'}"
     t0 = time.time()
-    sh("tmux", "new-session", "-d", "-s", SESSION, "-x", "200", "-y", "50", "-c", str(work), launch)
+    created = json.loads(sh(HERDR, "workspace", "create", "--label", SESSION, "--cwd", str(work), "--no-focus"))["result"]
+    WS, PANE = created["workspace"]["workspace_id"], created["root_pane"]["pane_id"]
+    sh(HERDR, "pane", "run", PANE, launch)
     me = wait("auto-registration", lambda: next((a for a in json.loads(ab("agents", "--json"))
                                                  if f"omp/{SESSION}" in a["aliases"]), None), 90)
     t["register_s"] = round(time.time() - t0, 2)
     assert me["id"].startswith(f"omp/{SESSION}-") and len(me["id"]) == len(f"omp/{SESSION}-") + 4, me["id"]
-    assert me["tmux_target"] and me["model"], me
-    print(f"registered {me['id']} aka {me['aliases']} tmux {me['tmux_target']} {me['provider']}/{me['model']}")
+    assert me["herdr_pane"] and me["herdr_workspace"] == SESSION and me["model"], me
+    print(f"registered {me['id']} aka {me['aliases']} herdr {me['herdr_workspace']} {me['herdr_pane']} "
+          f"{me['provider']}/{me['model']}")
     wait("idle", lambda: next(a for a in json.loads(ab("agents", "--json")) if a["id"] == me["id"])["state"] == "idle", 60)
 
     out = sh(sys.executable, str(REPO / "tests" / "v1" / "agent-bridge-v1.py"), "send", "dross", f"omp/{SESSION}",
@@ -119,12 +130,11 @@ def main():
     print(f"reply {reply['id']}: {reply['body']!r}; box v1 import: {imported.strip()}")
     assert not any((mac / "inject").iterdir()), "no inject opt-in: the wake must come from the extension"
 
-    # quit the worker (this session was created here): it must mark itself exited
-    sh("tmux", "send-keys", "-t", f"={SESSION}:", "-l", "/quit", timeout=2)
-    sh("tmux", "send-keys", "-t", f"={SESSION}:", "Enter", timeout=2)
+    # quit the worker (this workspace was created here): it must mark itself exited
+    sh(HERDR, "pane", "run", PANE, "/quit", timeout=5)
     wait("exited on quit", lambda: next(a for a in json.loads(ab("agents", "--all", "--json"))
                                         if a["id"] == me["id"])["status"] == "exited", 30)
-    subprocess.run(["tmux", "kill-session", "-t", f"={SESSION}"], capture_output=True, timeout=2)
+    close_workspace()
     srv.shutdown()
     print(json.dumps({"ok": True, "agent": me["id"], "model": MODEL, "timings": t}))
 
@@ -133,5 +143,5 @@ if __name__ == "__main__":
     try:
         main()
     except BaseException:
-        subprocess.run(["tmux", "kill-session", "-t", f"={SESSION}"], capture_output=True, timeout=2)
+        close_workspace()
         raise

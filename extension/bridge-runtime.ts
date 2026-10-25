@@ -7,7 +7,7 @@ import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const RUNTIME_VERSION = "2.1.0";
+export const RUNTIME_VERSION = "2.2.0";
 const CLI = process.env.AB_CLI || join(homedir(), "bin", "agent-bridge");
 const HOME = process.env.AB_HOME || join(homedir(), ".agent-bridge");
 const POINTER_GAP_MS = 20_000; // at most one pointer per 20 s; mail arriving inside the gap waits for it
@@ -48,6 +48,8 @@ export function createRuntime(pi, s) {
       ab_self: process.env.AB_SELF || "",
       tmux: process.env.TMUX || "",
       tmux_pane: process.env.TMUX_PANE || "",
+      herdr_pane: process.env.HERDR_PANE_ID || "",
+      herdr_workspace: process.env.HERDR_WORKSPACE_ID || "",
       ...model(ctx),
     };
     const r = await cli(["register", "--json", JSON.stringify(meta)]);
@@ -178,9 +180,10 @@ export function createRuntime(pi, s) {
       if (!r.ok) throw new Error(r.out || `agent-bridge ${name} failed`);
       return { content: [{ type: "text", text: r.out }] };
     },
-    // A swapped-in runtime announces itself once, so the registry shows which code each session runs.
+    // A swapped-in runtime registers once more: the registry then shows which code each session runs, and any
+    // new placement metadata (tmux, herdr) reaches sessions that started before this runtime knew about it.
     async adopted() {
-      if (s.current) await heartbeat();
+      if (s.current) await ensureRegistered(s.ctx);
     },
   };
 }
