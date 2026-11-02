@@ -334,9 +334,9 @@ class Bridge(unittest.TestCase):
         self.assertNotIn(mid, self.call("bridge_inbox", me)[1])
         mid2 = self.ab("deliver", self.box_token(me, "second")).stdout.split()[1]
         self.ab("pending", me)
-        self.db().execute("UPDATE notifications SET notified_at=notified_at-1000 WHERE msg_id=?", (mid2,)).connection.commit()
+        self.db().execute("UPDATE deliveries SET notified_at=notified_at-1000 WHERE msg_id=?", (mid2,)).connection.commit()
         self.assertEqual([m["id"] for m in json.loads(self.ab("pending", me).stdout)["new"]], [mid2])
-        self.assertEqual(self.db().execute("SELECT notify_count FROM notifications WHERE msg_id=?", (mid2,)).fetchone()[0], 2)
+        self.assertEqual(self.db().execute("SELECT notify_count FROM deliveries WHERE msg_id=?", (mid2,)).fetchone()[0], 2)
 
     def test_alias_mail_follows_the_alias_when_its_session_leaves_unread(self):
         old = self.register("s1", tmux="/tmp/sock", tmux_pane="%5")["id"]           # alias omp/e2e
@@ -352,69 +352,6 @@ class Bridge(unittest.TestCase):
         self.db().execute("UPDATE agents SET heartbeat_at=heartbeat_at-500 WHERE id=?", (crashed,)).connection.commit()
         third = self.register("s3", tmux="/tmp/sock", tmux_pane="%5")["id"]
         self.assertIn(mid2, self.call("bridge_inbox", third)[1])
-
-    def test_existing_alias_carrier_recovers_crashed_stale_and_pruned_mail(self):
-        for failure in ("dead-pid", "stale", "pruned"):
-            for operation in ("inbox", "pending", "heartbeat"):
-                with self.subTest(failure=failure, operation=operation):
-                    label = f"/tmp/{failure}-{operation}"
-                    a = self.register("a", cwd=label)["id"]
-                    alias = "omp/" + Path(label).name
-                    mid = self.ab("deliver", self.box_token(alias)).stdout.split()[1]
-                    exact = self.ab("deliver", self.box_token(a)).stdout.split()[1]
-                    read = self.ab("deliver", self.box_token(alias, "already read")).stdout.split()[1]
-                    self.call("bridge_read", a, id=read)
-                    b = self.register("b", cwd=label)["id"]
-                    self.assertNotIn(mid, self.call("bridge_inbox", b)[1])
-                    if failure == "dead-pid":
-                        self.register("a", cwd=label, pid=99999999, ab_self=a)
-                    else:
-                        self.db().execute("UPDATE agents SET heartbeat_at=heartbeat_at-90000 WHERE id=?", (a,))
-                        self.db().commit()
-                    if failure == "pruned":
-                        self.ab("prune")
-                        self.assertIsNone(self.db().execute("SELECT id FROM agents WHERE id=?", (a,)).fetchone())
-                    if operation == "heartbeat":
-                        self.assertEqual(json.loads(self.ab("heartbeat", b).stdout)["pending"], 1)
-                    elif operation == "pending":
-                        self.assertEqual([m["id"] for m in json.loads(self.ab("pending", b).stdout)["new"]], [mid])
-                    else:
-                        self.assertIn(mid, self.call("bridge_inbox", b)[1])
-                    self.assertIsNone(self.db().execute("SELECT rcpt FROM messages WHERE id=?", (mid,)).fetchone()[0])
-                    inbox = self.call("bridge_inbox", b, unread_only=False)[1]
-                    self.assertNotIn(exact, inbox)
-                    self.assertNotIn(read, inbox)
-                    for retained in (exact, read):
-                        self.assertEqual(self.db().execute("SELECT rcpt FROM messages WHERE id=?", (retained,)).fetchone()[0], a)
-                    self.assertEqual(self.call("bridge_ack", b, id=mid)[0], 0)
-
-    def test_notification_budget_belongs_to_each_alias_carrier(self):
-        for shared in (False, True):
-            with self.subTest(shared=shared):
-                label = f"/tmp/notify-{shared}".lower()
-                a = self.register("a", cwd=label)["id"]
-                if shared:
-                    b = self.register("b", cwd=label)["id"]
-                mid = self.ab("deliver", self.box_token("omp/" + Path(label).name)).stdout.split()[1]
-                if not shared:
-                    b = self.register("b", cwd=label)["id"]
-                for _ in range(3):
-                    self.assertEqual([m["id"] for m in json.loads(self.ab("pending", a).stdout)["new"]], [mid])
-                    self.db().execute("UPDATE notifications SET notified_at=notified_at-1000 WHERE msg_id=?", (mid,))
-                    self.db().commit()
-                self.assertEqual(json.loads(self.ab("pending", a).stdout)["new"], [])
-                # Upgrade a v2-shaped store: historical events must preserve A's spent budget, not charge B.
-                self.db().execute("DROP TABLE notifications")
-                self.db().execute("PRAGMA user_version=2")
-                self.db().execute("UPDATE events SET t=t-1000 WHERE ev='notified' AND msg_id=?", (mid,))
-                self.db().commit()
-                self.assertEqual(json.loads(self.ab("pending", a).stdout)["new"], [])
-                if not shared:
-                    self.ab("exit", a, "quit")
-                self.assertEqual(json.loads(self.ab("heartbeat", b).stdout)["pending"], 1)
-                self.assertEqual([m["id"] for m in json.loads(self.ab("pending", b).stdout)["new"]], [mid])
-                self.assertEqual(json.loads(self.ab("pending", b).stdout)["new"], [])
-                self.assertEqual(self.call("bridge_ack", b, id=mid)[0], 0)
 
     def test_ack_refuses_outbound_mail_so_it_still_reaches_the_box(self):
         me = self.register("s1")["id"]

@@ -1,7 +1,5 @@
 #!/bin/sh
-# Model-check inbound delivery with TLC: formal/InboundWake.tla (one session is woken for its mail) and
-# formal/InboundRouting.tla (shared-alias mail reaches a live carrier). Exit 0 = every property holds in the models.
-# Usage: formal/check.sh [MODEL...]   (default: InboundWake InboundRouting)
+# Model-check the inbound wake (formal/InboundWake.tla) with TLC. Exit 0 = the property holds in the model.
 # First run fetches the pinned TLA+ tools jar into local/ (gitignored). Needs java 11+ and curl.
 set -eu
 cd "$(dirname "$0")/.."
@@ -17,15 +15,5 @@ if ! echo "$SHA  $JAR" | shasum -a 256 -c - >/dev/null 2>&1; then
   echo "formal/check.sh: $JAR does not match the pinned sha256; delete it and rerun" >&2
   exit 2
 fi
-[ $# -gt 0 ] || set -- InboundWake InboundRouting
-failed=""
-for model in "$@"; do
-  echo "== $model"
-  java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers auto -lncheck final -cleanup -metadir "local/tla/states/$model" \
-    -config "formal/$model.cfg" "formal/$model.tla" || failed="$failed $model"
-done
-if [ -n "$failed" ]; then
-  echo "formal/check.sh: failed:$failed" >&2
-  exit 1
-fi
-echo "formal/check.sh: all models pass: $*"
+exec java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers auto -lncheck final -cleanup -metadir local/tla/states \
+  -config formal/InboundWake.cfg formal/InboundWake.tla

@@ -4,8 +4,7 @@
 One stdlib-only file (Python 3.9+). Mac side only; the box keeps running v1, whose tokens and webhook payload are unchanged.
 
 Store: SQLite in WAL mode at ~/.agent-bridge/v2/bridge.db. Tables: agents (live directory), agents_archive (pruned rows),
-messages (signed bodies), deliveries (message state and aggregate timestamps/counters), notifications (per-session
-pointer attempts), events (log), meta.
+messages (signed bodies), deliveries (one per message: its state and timestamps), events (log), meta.
   inbound to an omp agent:   queued -> notified -> read -> acked
   outbound to a box bot:     pending -> woken (webhook 2xx) | gave_up -> synced (box confirmed) -> read -> acked
 Every message is HMAC-signed with the v1 shared secret over the v1 canonical fields, so it can still travel as a v1 token.
@@ -17,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 VERSION = "2.0.0"
-SCHEMA = 3
+SCHEMA = 2
 MAX_BODY = 32 * 1024
 BOX = set()                            # box agent addresses (e.g. Grok bots), loaded from the store; the box's roster sets it
 LOCAL = {}                             # local bot address -> {webhook, token_file}, set with `agent-bridge local add`
@@ -28,7 +27,7 @@ ID_RE = re.compile(r"^[0-9]{13}-[0-9a-f]{8}$")
 DELAYS = [5, 15, 45, 120, 300, 600]   # webhook retry backoff (seconds) after each failed attempt; then gave_up
 STALE_AFTER = 120                      # seconds without a heartbeat before an agent counts as stale
 RENOTIFY_AFTER = 900                   # an unread, notified message is pointed out again after this long ...
-MAX_NOTIFY = 3                         # ... at most this many times per recipient session
+MAX_NOTIFY = 3                         # ... at most this many times in all
 NUDGE_GAP = 30                         # at most one tmux nudge per pane per this many seconds
 PREFIX = "[agent-bridge] From agent {frm}"
 HOST = socket.gethostname()
@@ -199,9 +198,6 @@ CREATE TABLE IF NOT EXISTS deliveries(
   queued_at REAL, notified_at REAL, notify_count INTEGER NOT NULL DEFAULT 0, read_at REAL, acked_at REAL,
   attempts INTEGER NOT NULL DEFAULT 0, next_at REAL, lease_until REAL, last_code TEXT, woken_at REAL, synced_at REAL);
 CREATE INDEX IF NOT EXISTS deliveries_state ON deliveries(direction, state, next_at);
-CREATE TABLE IF NOT EXISTS notifications(
-  msg_id TEXT NOT NULL REFERENCES messages(id), agent TEXT NOT NULL,
-  notified_at REAL NOT NULL, notify_count INTEGER NOT NULL, PRIMARY KEY(msg_id, agent));
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, t REAL NOT NULL, ev TEXT NOT NULL, msg_id TEXT, agent TEXT,
   detail TEXT);
 CREATE INDEX IF NOT EXISTS events_t ON events(t);
@@ -245,12 +241,6 @@ def connect():
             for stmt in DDL.split(";"):
                 if stmt.strip():
                     c.execute(stmt)
-            if version in (1, 2):
-                # Old pending calls already recorded the recipient and timestamp in the event log.
-                c.execute("INSERT OR IGNORE INTO notifications(msg_id, agent, notified_at, notify_count) "
-                          "SELECT e.msg_id, e.agent, max(e.t), count(*) FROM events e "
-                          "JOIN messages m ON m.id=e.msg_id WHERE e.ev='notified' AND e.agent IS NOT NULL "
-                          "GROUP BY e.msg_id, e.agent")
             c.execute("INSERT OR IGNORE INTO agents(id, kind, label, state) VALUES('dross', 'box', 'Dross', 'remote')")
             c.execute(f"PRAGMA user_version={SCHEMA}")
     c.execute("PRAGMA synchronous=FULL")
@@ -532,14 +522,13 @@ def mine(c, me, m):
 
 def op_inbox(c, me=None, unread_only=True, limit=50):
     """me=None lists every address (operator view)."""
-    with tx(c):
-        ids = addrs_of(c, me) if me else None
-        release_alias_mail(c, ids[1:] if ids else None)
-        where, args = visible_sql(ids) if ids else ("1=1", [])
-        states = ("queued", "notified") if unread_only else ("queued", "notified", "read")
-        rows = c.execute(f"SELECT m.*, d.state FROM messages m JOIN deliveries d ON d.msg_id=m.id WHERE d.direction='in' "
-                         f"AND {where} AND d.state IN ({','.join('?' * len(states))}) ORDER BY m.created_at LIMIT ?",
-                         args + list(states) + [int(limit)]).fetchall()
+    where, args = ("1=1", [])
+    if me:
+        where, args = visible_sql(addrs_of(c, me))
+    states = ("queued", "notified") if unread_only else ("queued", "notified", "read")
+    rows = c.execute(f"SELECT m.*, d.state FROM messages m JOIN deliveries d ON d.msg_id=m.id WHERE d.direction='in' "
+                     f"AND {where} AND d.state IN ({','.join('?' * len(states))}) ORDER BY m.created_at LIMIT ?",
+                     args + list(states) + [int(limit)]).fetchall()
     out = []
     for m in rows:
         first = m["body"].strip().splitlines()[0][:100] if m["body"].strip() else ""
@@ -582,28 +571,16 @@ def op_reply(c, me, mid, body):
     return text + f"; acked {mid}"
 
 
-def pending_rows(c, me, ids, t):
-    """The same per-session eligibility query drives both heartbeat and pending."""
-    where, args = visible_sql(ids)
-    return c.execute(f"SELECT m.id, m.from_addr FROM messages m JOIN deliveries d ON d.msg_id=m.id "
-                     f"LEFT JOIN notifications n ON n.msg_id=m.id AND n.agent=? "
-                     f"WHERE d.direction='in' AND {where} AND d.state IN ('queued','notified') "
-                     f"AND (n.msg_id IS NULL OR (n.notified_at<? AND n.notify_count<?))",
-                     [me] + args + [t - RENOTIFY_AFTER, MAX_NOTIFY]).fetchall()
-
-
 def op_pending(c, me):
     """Claim the messages `me` has not been pointed at yet (or that sat unread past RENOTIFY_AFTER)."""
+    where, args = visible_sql(addrs_of(c, me))
     t = now()
     with tx(c):
-        ids = addrs_of(c, me)
-        release_alias_mail(c, ids[1:])
-        where, args = visible_sql(ids)
-        rows = pending_rows(c, me, ids, t)
+        rows = c.execute(f"SELECT m.id, m.from_addr, d.state, d.notified_at, d.notify_count FROM messages m "
+                         f"JOIN deliveries d ON d.msg_id=m.id WHERE d.direction='in' AND {where} "
+                         f"AND (d.state='queued' OR (d.state='notified' AND d.notified_at<? AND d.notify_count<?))",
+                         args + [t - RENOTIFY_AFTER, MAX_NOTIFY]).fetchall()
         for r in rows:
-            c.execute("INSERT INTO notifications(msg_id, agent, notified_at, notify_count) VALUES(?,?,?,1) "
-                      "ON CONFLICT(msg_id, agent) DO UPDATE SET notified_at=excluded.notified_at, "
-                      "notify_count=notifications.notify_count+1", (r["id"], me, t))
             c.execute("UPDATE deliveries SET state='notified', notified_at=?, notify_count=notify_count+1 WHERE msg_id=?",
                       (t, r["id"]))
             event(c, "notified", r["id"], me)
@@ -684,19 +661,16 @@ def op_heartbeat(c, aid, state=None, model=None, provider=None, ext=None):
         c.execute("UPDATE agents SET heartbeat_at=?, state=COALESCE(?, state), model=COALESCE(?, model),"
                   " provider=COALESCE(?, provider), ext_version=COALESCE(?, ext_version) WHERE id=?",
                   (now(), state, model, provider, ext, aid))
-        ids = addrs_of(c, aid)
-        release_alias_mail(c, ids[1:])
-        n = len(pending_rows(c, aid, ids, now()))
+    where, args = visible_sql(addrs_of(c, aid))
+    n = c.execute(f"SELECT count(*) FROM messages m JOIN deliveries d ON d.msg_id=m.id WHERE d.direction='in' AND {where}"
+                  f" AND (d.state='queued' OR (d.state='notified' AND d.notified_at<? AND d.notify_count<?))",
+                  args + [now() - RENOTIFY_AFTER, MAX_NOTIFY]).fetchone()[0]
     return {"pending": n, "policy": POLICY_VERSION}
 
 
-def release_alias_mail(c, aliases=None):
-    """Release unread alias mail from dead, stale or missing owners; preserve exact-id and read mail.
-    Runs inside a transaction. With no alias filter, also recover mail left by earlier pruning."""
-    if aliases is None:
-        aliases = [r[0] for r in c.execute("SELECT DISTINCT m.to_addr FROM messages m "
-                   "JOIN deliveries d ON d.msg_id=m.id WHERE d.direction='in' "
-                   "AND d.state IN ('queued','notified') AND m.rcpt IS NOT NULL AND m.rcpt!=m.to_addr")]
+def release_alias_mail(c, aliases):
+    """Unread mail sent to an alias, bound to a session that is no longer live, goes back to the alias so whichever
+    session carries it next can see it. Mail sent to an exact id stays with that id. Runs inside a transaction."""
     for alias in aliases:
         for m in c.execute("SELECT m.id, m.rcpt FROM messages m JOIN deliveries d ON d.msg_id=m.id WHERE "
                            "d.direction='in' AND d.state IN ('queued','notified') AND m.to_addr=? AND m.rcpt IS NOT NULL "
@@ -814,7 +788,6 @@ def op_prune(c, exited_after=EXITED_KEEP, stale_after=STALE_KEEP):
             if (s == "exited" and age > exited_after) or (s == "stale" and age > stale_after):
                 archive_agent(c, r, s)
                 moved.append(r["id"])
-        release_alias_mail(c)
         if moved:
             event(c, "prune", moved=moved)
     return moved

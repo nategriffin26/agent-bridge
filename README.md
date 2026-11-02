@@ -90,10 +90,9 @@ agent-bridge local rm ops
 ## Architecture
 
 - **One file, stdlib only.** `src/agent_bridge.py` is the store, CLI, stdio MCP server, webhook pump and tmux fallback. One owner of all state.
-- **Store.** SQLite in WAL mode at `~/.agent-bridge/v2/bridge.db`: `agents`, `agents_archive`, `messages`, `deliveries` (message state and aggregate timestamps/counters), `notifications` (retry count and timestamp per message/session), `events`, `meta`. Schema upgrades preserve notification history from the event log. Every statement retries a briefly locked store for up to 1.5 s, then exits 4.
+- **Store.** SQLite in WAL mode at `~/.agent-bridge/v2/bridge.db`: `agents`, `agents_archive`, `messages`, `deliveries` (one row per message: state and timestamps), `events`, `meta`. Every statement retries a briefly locked store for up to 1.5 s, then exits 4; nothing hangs.
 - **Identity.** `omp/<label>-<4 hex>`, where the label is `AB_SELF`, else the tmux session, else the folder, and the suffix comes from the omp session id, so `/reload` and `/resume` keep it. The tmux session name is an alias that resolves to the one live agent carrying it. Heartbeats every 30 s; `stale` after 120 s or a dead pid; `exited` on shutdown. The pump archives exited rows after an hour and stale rows after a day.
-- **Alias handoff.** Unread alias mail bound to a dead or stale session is released when another carrier checks its inbox, polls pending mail, or heartbeats; registration, exit and pruning also release it. Existing live carriers need not register again. Exact-ID mail and already-read mail stay with their recipient. Unresolved alias mail is visible to every carrier until one acknowledges it; pointers are not exclusive work claims, so concurrent carriers can act on the same message.
-- **Wake.** The extension watches a per-agent notify file and asks the CLI for new mail. Idle sessions get a turn; busy ones get the pointer at the next step boundary. Each recipient session has its own three-pointer budget, with retries after 15 minutes unread; another session's attempts cannot exhaust it. The pointer never includes the message body.
+- **Wake.** The extension watches a per-agent notify file and asks the CLI for new mail. Idle sessions get a turn; busy ones get the pointer at the next step boundary. It never injects the message body.
 - **Hot reload.** `extension/agent-bridge.ts` is a stable shim with fixed hooks and tools. It re-imports `extension/bridge-runtime.ts` whenever that file changes, so behavior updates reach running sessions within 3 s. The policy agents follow comes from `agent-bridge policy`; when its version changes, running sessions get the new text in context.
 - **Mac → box.** Sends are stored first. A detached pump POSTs `{agent_bridge:1, id, from, to, token}` to the webhook with backoff (5 s to 10 min) and an absolute 15 s cap per attempt; launchd retries stranded rows every minute. If the webhook is down, the box sweep still pulls with `export`.
 - **tmux, last resort.** For sessions without the extension, opt in with `touch ~/.agent-bridge/inject/<name>`: it leaves copy mode, targets the exact pane, types a one-line pointer, and every call is capped at 2 s.
@@ -102,9 +101,8 @@ agent-bridge local rm ops
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests
+python3 -m unittest discover -s tests     # about 20 s
 python3 tests/e2e.py [--model M]          # a real omp worker in a throwaway tmux session
-formal/check.sh                         # inbound wake and shared-alias routing models
 ```
 
 The unit tests run the real CLI against throwaway homes, with the v1 box code on the other side. They cover signing, dedupe, at-least-once redelivery, aliases, the roster, pruning, the webhook (down, slow, trickling), the tmux fallback with a fake tmux, and a locked store.

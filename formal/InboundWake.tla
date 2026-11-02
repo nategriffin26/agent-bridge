@@ -7,9 +7,7 @@
 (* src/agent_bridge.py; TypeScript is extension/bridge-runtime.ts and the *)
 (* shim extension/agent-bridge.ts. Each action below names the function it *)
 (* stands for; one action is one transaction (Python) or one synchronous   *)
-(* run of the event loop up to an await (TypeScript). The pointer budget  *)
-(* is this session's notifications row; other sessions sharing an alias   *)
-(* are formal/InboundRouting.tla.                                          *)
+(* run of the event loop up to an await (TypeScript).                      *)
 (* Coverage, bounds and assumptions: .omp/skills/wake-formal/SKILL.md.     *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
@@ -20,8 +18,8 @@ CONSTANTS Msgs,       \* message ids
 
 VARIABLES
   dstate,     \* deliveries.state: "none" (not stored yet), "queued", "notified", "read"
-  ncount,     \* notifications.notify_count for (msg_id, this session); 0 = no row
-  old,        \* notifications.notified_at < now - RENOTIFY_AFTER for (msg_id, this session)
+  ncount,     \* deliveries.notify_count
+  old,        \* deliveries.notified_at < now - RENOTIFY_AFTER
   toTouch,    \* stored messages whose CLI has committed but not run touch_notify yet
   unseen,     \* the notify file v2/notify/<id> has an mtime above s.lastStamp (stamp > s.lastStamp in poll())
   lastZero,   \* s.lastStamp = 0
@@ -64,12 +62,13 @@ Init ==
   /\ pointed = {}
   /\ faults = 0
 
-(* pending_rows: the one per-session filter op_pending claims with and op_heartbeat counts with. *)
-\* d.state IN ('queued','notified') AND (n.msg_id IS NULL OR (n.notified_at<? AND n.notify_count<?))
-PendingClaims(m) == /\ dstate[m] \in {"queued", "notified"}
-                    /\ \/ ncount[m] = 0
-                       \/ old[m] /\ ncount[m] < MaxNotify
-HeartbeatCounts(m) == PendingClaims(m)
+(* The two copies of the "due for a pointer" filter in the Python. *)
+\* op_pending: d.state='queued' OR (d.state='notified' AND d.notified_at<? AND d.notify_count<?)
+PendingClaims(m) == \/ dstate[m] = "queued"
+                    \/ dstate[m] = "notified" /\ old[m] /\ ncount[m] < MaxNotify
+\* op_heartbeat: the same filter, counted
+HeartbeatCounts(m) == \/ dstate[m] = "queued"
+                      \/ dstate[m] = "notified" /\ old[m] /\ ncount[m] < MaxNotify
 
 (* checkMail() in bridge-runtime.ts up to its await; d is s.due on entry. Sets due', checking', pend'. *)
 CheckMail(d) ==
@@ -114,8 +113,7 @@ Poll ==
         /\ IF d THEN CheckMail(d) ELSE UNCHANGED <<due, checking, pend>>
   /\ UNCHANGED <<store, toTouch, registered, gap, claimed, hb, hbDue, pointed, faults>>
 
-\* op_pending's transaction: release_alias_mail (no effect on this session's own mail), claim every row
-\* PendingClaims picks: upsert notifications (notified_at, notify_count+1), set deliveries.state 'notified'
+\* op_pending's transaction: claim every row PendingClaims picks, set state 'notified', notified_at, notify_count+1
 PendingTx ==
   /\ pend = "running"
   /\ LET rows == {m \in Msgs : PendingClaims(m)}
@@ -149,7 +147,7 @@ PendingLost ==
   /\ pend' = "none" /\ checking' = FALSE /\ claimed' = {} /\ faults' = faults + 1
   /\ UNCHANGED <<store, toTouch, unseen, lastZero, registered, due, gap, hb, hbDue, pointed>>
 
-\* heartbeat(), every HEARTBEAT_MS: op_heartbeat's transaction releases alias mail, then counts pending_rows
+\* heartbeat(), every HEARTBEAT_MS: op_heartbeat counts the rows HeartbeatCounts picks
 HeartbeatTx ==
   /\ registered /\ hb = "none"
   /\ hb' = "returned"
@@ -168,9 +166,9 @@ GapEnds ==
   /\ gap /\ gap' = FALSE
   /\ UNCHANGED <<store, toTouch, unseen, lastZero, registered, due, checking, calls, pointed, faults>>
 
-\* Time passes RENOTIFY_AFTER after this session's notifications.notified_at
+\* Time passes RENOTIFY_AFTER after a row's notified_at
 Age(m) ==
-  /\ ncount[m] > 0 /\ ~old[m]
+  /\ dstate[m] = "notified" /\ ~old[m]
   /\ old' = [old EXCEPT ![m] = TRUE]
   /\ UNCHANGED <<dstate, ncount, toTouch, unseen, ext, calls, pointed, faults>>
 
