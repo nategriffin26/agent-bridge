@@ -4,7 +4,7 @@
   python3 tests/e2e.py [--model anthropic/claude-sonnet-5-5] [--installed]
 
 It must auto-register; a box-signed token from dross (made by the v1 box code) is delivered with the Mac CLI; the
-extension must wake the worker (no tmux typing: there is no inject opt-in); the worker reads and replies; the reply
+extension must wake the worker without tmux typing; the worker gets the body inline and replies; the reply
 must land addressed to dross and the webhook (a local mock, never the real one) must be attempted.
 Everything runs against a throwaway AB_HOME. --installed uses ~/bin/agent-bridge and the extension omp discovers
 on its own; the default passes the repo's CLI and extension explicitly. Prints timings as JSON at the end.
@@ -105,9 +105,9 @@ def main():
     t["notified_s"] = round(db()[mid]["notified_at"] - t0, 2)
     reply = wait("reply to dross", lambda: next((m for m in db().values() if m["reply_to"] == mid), None), 180)
     t["reply_s"] = round(reply["created_at"] - t0, 2)
-    t["read_s"] = round(db()[mid]["read_at"] - t0, 2)   # bridge_read, or the reply itself (answering implies reading)
+    t["read_s"] = round(db()[mid]["read_at"] - t0, 2)   # inline injection marks the message read
     assert (reply["from"], reply["to"], reply["thread"]) == (me["id"], "dross", mid), reply
-    assert db()[mid]["state"] == "acked", db()[mid]
+    assert db()[mid]["state"] == "read", db()[mid]
     wait("webhook attempted", lambda: any(h[1]["id"] == reply["id"] for h in hooks), 30)
     hook = next(h for h in hooks if h[1]["id"] == reply["id"])
     t["webhook_s"] = round(hook[0] - t0, 2)
@@ -117,7 +117,6 @@ def main():
     assert imported.startswith("stored"), imported
     wait("woken", lambda: db()[reply["id"]]["state"] == "woken", 10)
     print(f"reply {reply['id']}: {reply['body']!r}; box v1 import: {imported.strip()}")
-    assert not any((mac / "inject").iterdir()), "no inject opt-in: the wake must come from the extension"
 
     # quit the worker (this session was created here): it must mark itself exited
     sh("tmux", "send-keys", "-t", f"={SESSION}:", "-l", "/quit", timeout=2)

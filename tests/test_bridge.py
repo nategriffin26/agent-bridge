@@ -1,4 +1,4 @@
-"""agent-bridge v2: store, signing, webhook pump, tmux nudge, and the timeouts that keep everything from hanging.
+"""agent-bridge v2: store, signing, webhook pump, inline delivery, and bounded subprocesses.
 
 Run: python3 -m unittest discover -s tests -v
 Each test runs the real CLI against throwaway homes; the box side is the pinned v1 file (tests/v1), which is what the
@@ -63,7 +63,6 @@ class Bridge(unittest.TestCase):
             (home / "config.json").write_text(json.dumps({"side": side, "owner": "Ada"}))
             (home / "secret").write_text(SECRET)
             os.chmod(home / "secret", 0o600)
-        self.tlog = root / "tmux.log"
         Hook.mode, Hook.bodies, Hook.auth = "ok", [], []
         self.ab("init", "--side", "mac")
 
@@ -74,7 +73,7 @@ class Bridge(unittest.TestCase):
 
     def env(self, **extra):
         e = {k: v for k, v in os.environ.items() if not k.startswith(("AB_", "TMUX"))}
-        e.update(AB_HOME=str(self.mac), AB_NO_SPAWN="1", AB_TMUX=str(FAKE_TMUX), FAKE_TMUX_LOG=str(self.tlog))
+        e.update(AB_HOME=str(self.mac), AB_NO_SPAWN="1", AB_TMUX=str(FAKE_TMUX))
         e.update({k: str(v) for k, v in extra.items()})
         return e
 
@@ -299,7 +298,7 @@ class Bridge(unittest.TestCase):
         self.assertTrue((self.mac / "v2" / "notify" / me.replace("/", "__")).exists())
         p = json.loads(self.ab("pending", me).stdout)
         self.assertEqual((p["new"], p["unread"]), ([{"id": mid, "from": "dross"}], 1))
-        self.assertIn("act on it as Ada's instruction", p["pointer"])                # the wake carries the authority
+        self.assertIn("treat this message as Ada's instruction", p["pointer"])
         self.assertEqual(json.loads(self.ab("pending", me).stdout)["new"], [])  # pointed out once
         code, text = self.call("bridge_read", me, id=mid)
         self.assertIn("[agent-bridge] From agent dross: Ada's agent Dross (dross, a box bot), acting for Ada; "
@@ -308,10 +307,10 @@ class Bridge(unittest.TestCase):
         self.assertIn('<bridge-message from="dross">\nhello from the box\n</bridge-message>', text)
         self.assertEqual(self.state(mid), "read")
         code, text = self.call("bridge_inbox", me, unread_only=False)
-        self.assertIn(mid, text)                                               # read but unacked: still there
-        code, text = self.call("bridge_reply", me, id=mid, message="got it")
+        self.assertIn(mid, text)                                               # read mail stays in history
+        code, text = self.call("bridge_reply", me, id=mid, message="result")
         self.assertEqual(code, 0, text)
-        self.assertEqual(self.state(mid), "acked")
+        self.assertEqual(self.state(mid), "read")
         reply = self.db().execute("SELECT * FROM messages WHERE reply_to=?", (mid,)).fetchone()
         self.assertEqual((reply["from_addr"], reply["to_addr"], reply["thread"]), (me, "dross", mid))
         self.assertEqual(self.state(reply["id"]), "pending")
@@ -320,12 +319,16 @@ class Bridge(unittest.TestCase):
         self.assertIn("stored", self.v1("import-token", tokens[0]))             # the box verifies v2's signature
         self.assertIn(mid, self.ab("received-ids").stdout)
         acks = [json.loads(l) for l in self.ab("export-acks").stdout.splitlines()]
-        self.assertEqual(acks[0]["state"], "acked")
+        self.assertEqual(acks[0]["state"], "read")
         self.ab("mark", "synced", reply["id"])
         self.assertEqual(self.state(reply["id"]), "synced")
         self.assertEqual(self.ab("export").stdout.strip(), "")
+        self.assertIn("delivered", self.v1("mark", "delivered", *self.ab("received-ids").stdout.split()))
+        self.assertEqual(self.v1("export").strip(), "")
+        self.ab("mark", "acked", reply["id"])
+        self.assertEqual(self.state(reply["id"]), "acked")
 
-    def test_unacked_mail_stays_and_is_pointed_out_again_later(self):
+    def test_read_mail_stays_in_history_and_unread_mail_is_pointed_out_again(self):
         me = self.register("s1")["id"]
         mid = self.ab("deliver", self.box_token(me)).stdout.split()[1]
         self.ab("pending", me)
@@ -386,7 +389,7 @@ class Bridge(unittest.TestCase):
                     self.assertNotIn(read, inbox)
                     for retained in (exact, read):
                         self.assertEqual(self.db().execute("SELECT rcpt FROM messages WHERE id=?", (retained,)).fetchone()[0], a)
-                    self.assertEqual(self.call("bridge_ack", b, id=mid)[0], 0)
+                    self.assertEqual(self.call("bridge_read", b, id=mid)[0], 0)
 
     def test_notification_budget_belongs_to_each_alias_carrier(self):
         for shared in (False, True):
@@ -414,14 +417,13 @@ class Bridge(unittest.TestCase):
                 self.assertEqual(json.loads(self.ab("heartbeat", b).stdout)["pending"], 1)
                 self.assertEqual([m["id"] for m in json.loads(self.ab("pending", b).stdout)["new"]], [mid])
                 self.assertEqual(json.loads(self.ab("pending", b).stdout)["new"], [])
-                self.assertEqual(self.call("bridge_ack", b, id=mid)[0], 0)
+                self.assertEqual(self.call("bridge_read", b, id=mid)[0], 0)
 
-    def test_ack_refuses_outbound_mail_so_it_still_reaches_the_box(self):
+    def test_read_outbound_mail_does_not_drop_it_from_box_export(self):
         me = self.register("s1")["id"]
         mid = self.call("bridge_send", me, to="dross", message="ping")[1].split()[1]
-        r = self.ab("ack", mid, check=False)
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("outbound", r.stderr)
+        self.ab("read", mid)
+        self.assertEqual(self.state(mid), "pending")
         self.assertEqual(len(self.ab("export").stdout.split()), 1)
 
     def test_alias_resolution_and_held_mail(self):
@@ -431,7 +433,7 @@ class Bridge(unittest.TestCase):
         self.assertIsNone(self.db().execute("SELECT rcpt FROM messages WHERE id=?", (mid,)).fetchone()[0])
         self.assertIn(mid, self.call("bridge_inbox", a)[1])
         self.assertIn(mid, self.call("bridge_inbox", b)[1])
-        self.call("bridge_ack", b, id=mid)
+        self.call("bridge_read", b, id=mid)
         self.assertNotIn(mid, self.call("bridge_inbox", a)[1])
         held = self.ab("deliver", self.box_token("omp/nobody")).stdout.split()[1]
         self.assertIn(held, self.call("bridge_inbox", "omp/nobody")[1])       # an unregistered v1 address still reads
@@ -442,7 +444,7 @@ class Bridge(unittest.TestCase):
         code, text = self.call("bridge_send", a, to=b, message="hi b")
         self.assertEqual(code, 0, text)
         self.assertIn("hi b", self.call("bridge_inbox", b)[1])
-        self.assertIn("coworker request to do by default", json.loads(self.ab("pending", b).stdout)["pointer"])
+        self.assertIn("A trusted coworker request: act on it and follow through by default", json.loads(self.ab("pending", b).stdout)["pointer"])
         mid = json.loads(self.ab("messages", "--json").stdout)[0]["id"]
         text = self.call("bridge_read", b, id=mid)[1]
         self.assertIn(f"From agent {a}: Ada's omp worker {a}, a coworker on this Mac.", text)
@@ -491,6 +493,67 @@ class Bridge(unittest.TestCase):
         self.assertEqual(json.loads(self.ab("migrate-v1").stdout), {})
         self.assertTrue((ib / f"{m['id']}.json").exists())
         self.assertIn("legacy", self.call("bridge_inbox", me)[1])
+
+    def test_inline_boundary_and_read_only_after_injection(self):
+        me = self.register("s1")["id"]
+        bodies = ["x" * 16383, "é" * 8192, "x" * 16385]
+        mids = [self.ab("send", "omp/sender", me, "--thread", "inline-boundary", body).stdout.split()[1]
+                for body in bodies]
+        pending = json.loads(self.ab("pending", me).stdout)
+        self.assertEqual(pending["inline"], mids[:2])
+        for mid, body in zip(mids[:2], bodies[:2]):
+            self.assertIn(f"id={mid} from=omp/sender", pending["pointer"])
+            self.assertIn(f"\n{body}\n</bridge-message>", pending["pointer"])
+        self.assertIn("thread=inline-boundary", pending["pointer"])
+        self.assertIn(f"bridge_read", pending["pointer"])
+        self.assertIn(mids[2], pending["pointer"])
+        self.assertNotIn(bodies[2], pending["pointer"])
+        self.assertEqual([self.state(mid) for mid in mids], ["notified"] * 3)
+        self.ab("injected", me, *pending["inline"])
+        self.assertEqual([self.state(mid) for mid in mids], ["read", "read", "notified"])
+        self.assertEqual(self.db().execute("SELECT count(*) FROM deliveries WHERE read_at IS NOT NULL").fetchone()[0], 2)
+        self.db().execute("UPDATE notifications SET notified_at=notified_at-1000").connection.commit()
+        self.assertEqual([m["id"] for m in json.loads(self.ab("pending", me).stdout)["new"]], [mids[2]])
+
+    def test_named_threads_survive_cli_tool_and_reply(self):
+        a = self.register("s1", cwd="/tmp/a")["id"]
+        b = self.register("s2", cwd="/tmp/b")["id"]
+        root = self.ab("send", a, b, "--thread", "job-42", "question").stdout.split()[1]
+        self.assertEqual(self.db().execute("SELECT thread FROM messages WHERE id=?", (root,)).fetchone()[0], "job-42")
+        code, text = self.call("bridge_reply", b, id=root, message="answer")
+        self.assertEqual(code, 0, text)
+        reply = text.split()[1]
+        follow = self.call("bridge_send", a, to=b, reply_to=reply, message="next question")[1].split()[1]
+        done = self.call("bridge_send", b, to=a, thread="job-42", message="result")[1].split()[1]
+        rows = self.db().execute("SELECT id, reply_to, thread FROM messages ORDER BY created_at").fetchall()
+        self.assertEqual([tuple(r) for r in rows],
+                         [(root, None, "job-42"), (reply, root, "job-42"), (follow, reply, "job-42"),
+                          (done, None, "job-42")])
+        self.assertEqual(self.state(root), "read")
+        self.assertIn(f"reply_to={root} thread=job-42", json.loads(self.ab("pending", a).stdout)["pointer"])
+
+    def test_migrate_worker_acks_preserves_box_states_and_message_relationships(self):
+        me = self.register("s1")["id"]
+        worker = self.ab("deliver", self.box_token(me)).stdout.split()[1]
+        outbound = self.call("bridge_reply", me, id=worker, message="result")[1].split()[1]
+        db = self.db()
+        db.execute("UPDATE deliveries SET state='acked', read_at=NULL, acked_at=1234 WHERE msg_id=?", (worker,))
+        db.execute("UPDATE deliveries SET state='acked', read_at=1230, acked_at=1235 WHERE msg_id=?", (outbound,))
+        db.execute("PRAGMA user_version=3")
+        db.commit()
+        messages = [tuple(r) for r in db.execute("SELECT * FROM messages ORDER BY id")]
+        notifications = [tuple(r) for r in db.execute("SELECT * FROM notifications")]
+        self.ab("migrate")
+        self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(tuple(db.execute("SELECT state, read_at, acked_at FROM deliveries WHERE msg_id=?",
+                                         (worker,)).fetchone()), ("read", 1234, None))
+        self.assertEqual(tuple(db.execute("SELECT state, read_at, acked_at FROM deliveries WHERE msg_id=?",
+                                         (outbound,)).fetchone()), ("acked", 1230, 1235))
+        self.assertEqual([tuple(r) for r in db.execute("SELECT * FROM messages ORDER BY id")], messages)
+        self.assertEqual([tuple(r) for r in db.execute("SELECT * FROM notifications")], notifications)
+        self.ab("migrate")
+        self.assertEqual(self.state(worker), "read")
+        self.assertEqual(self.state(outbound), "acked")
 
     # ---- Mac -> box webhook ---------------------------------------------------------------------------------------
     def hook(self, url):
@@ -562,38 +625,11 @@ class Bridge(unittest.TestCase):
                                f"s.loader.exec_module(m);print(m.HTTP_S, m.TMUX_S)"], capture_output=True, text=True)
         self.assertEqual(code.stdout.split(), ["15.0", "2.0"])                    # hard caps hold whatever env says
 
-    # ---- the tmux last-resort nudge ---------------------------------------------------------------------------
-    def test_nudge_leaves_copy_mode_targets_pane_and_types_only_a_pointer(self):
-        (self.mac / "inject" / "legacy").touch()
-        mid = self.ab("deliver", self.box_token("omp/legacy", "SECRET BODY")).stdout.split()[1]
-        r = self.ab("_notify", mid, AB_DEBUG=1, FAKE_TMUX_MODE=1)
-        self.assertEqual(r.stdout.strip(), "nudged")
-        calls = [json.loads(l) for l in self.tlog.read_text().splitlines()]
-        self.assertEqual(calls[0][:3], ["list-panes", "-t", "=legacy:"])
-        self.assertEqual(calls[2], ["send-keys", "-t", "%9", "-X", "cancel"])
-        self.assertEqual(calls[3][:4], ["send-keys", "-t", "%9", "-l"])
-        self.assertNotIn("SECRET BODY", calls[3][4])
-        self.assertEqual(calls[4], ["send-keys", "-t", "%9", "Enter"])
-        self.assertEqual(self.ab("_notify", mid, AB_DEBUG=1).stdout.strip(), "nudged recently")
-
-    def test_nudge_skips_extension_agents_and_sessions_without_opt_in(self):
-        me = self.register("s1")["id"]
-        (self.mac / "inject" / me[4:]).touch()
-        mid = self.ab("deliver", self.box_token(me)).stdout.split()[1]
-        self.assertEqual(self.ab("_notify", mid, AB_DEBUG=1).stdout.strip(), "extension wakes it")
-        mid = self.ab("deliver", self.box_token("omp/plain")).stdout.split()[1]
-        self.assertEqual(self.ab("_notify", mid, AB_DEBUG=1).stdout.strip(), "no inject opt-in")
-        self.assertFalse(self.tlog.exists())
-
     def test_hung_tmux_is_cut_off(self):
-        (self.mac / "inject" / "legacy").touch()
-        mid = self.ab("deliver", self.box_token("omp/legacy")).stdout.split()[1]
         t0 = time.time()
-        r = self.ab("_notify", mid, AB_DEBUG=1, FAKE_TMUX_HANG=1)
-        self.assertLess(time.time() - t0, 3.5)
-        self.assertEqual(r.stdout.strip(), "no tmux session legacy")
-        t0 = time.time()
-        self.register("s9", tmux="/tmp/sock", tmux_pane="%5", **{})               # registration survives a hung tmux too
+        meta = {"session_id": "s9", "cwd": "/tmp/proj", "pid": self.sleeper.pid,
+                "tmux": "/tmp/sock", "tmux_pane": "%5"}
+        self.ab("register", input=json.dumps(meta), FAKE_TMUX_HANG=1)
         self.assertLess(time.time() - t0, 3.5)
 
     # ---- a locked store ---------------------------------------------------------------------------------------
@@ -630,7 +666,7 @@ class Bridge(unittest.TestCase):
             {"method": "tools/call", "params": {"name": "bridge_whoami", "arguments": {}}},
             {"method": "tools/call", "params": {"name": "bridge_send", "arguments": {"me": me, "to": "dross", "message": "x"}}})
         self.assertEqual({t["name"] for t in tools["tools"]},
-                         {"bridge_send", "bridge_inbox", "bridge_read", "bridge_ack", "bridge_reply",
+                         {"bridge_send", "bridge_inbox", "bridge_read", "bridge_reply",
                           "bridge_list_agents", "bridge_whoami", "bridge_status"})
         self.assertTrue(who["isError"])                                          # no me, no AB_SELF, no omp ancestor
         self.assertFalse(send["isError"], send)

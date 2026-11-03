@@ -16,9 +16,10 @@ import urllib.error, urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
-VERSION = "2.0.0"
-SCHEMA = 3
+VERSION = "2.2.0"
+SCHEMA = 4
 MAX_BODY = 32 * 1024
+INLINE_BODY = 16 * 1024               # UTF-8 bytes; larger bodies are fetched with bridge_read
 BOX = set()                            # box agent addresses (e.g. Grok bots), loaded from the store; the box's roster sets it
 LOCAL = {}                             # local bot address -> {webhook, token_file}, set with `agent-bridge local add`
 EXITED_KEEP = 3600                     # an exited omp row is archived after this long ...
@@ -29,7 +30,6 @@ DELAYS = [5, 15, 45, 120, 300, 600]   # webhook retry backoff (seconds) after ea
 STALE_AFTER = 120                      # seconds without a heartbeat before an agent counts as stale
 RENOTIFY_AFTER = 900                   # an unread, notified message is pointed out again after this long ...
 MAX_NOTIFY = 3                         # ... at most this many times per recipient session
-NUDGE_GAP = 30                         # at most one tmux nudge per pane per this many seconds
 PREFIX = "[agent-bridge] From agent {frm}"
 HOST = socket.gethostname()
 
@@ -251,6 +251,8 @@ def connect():
                           "SELECT e.msg_id, e.agent, max(e.t), count(*) FROM events e "
                           "JOIN messages m ON m.id=e.msg_id WHERE e.ev='notified' AND e.agent IS NOT NULL "
                           "GROUP BY e.msg_id, e.agent")
+            c.execute("UPDATE deliveries SET state='read', read_at=coalesce(read_at, acked_at), acked_at=NULL "
+                      "WHERE direction='in' AND state='acked'")
             c.execute("INSERT OR IGNORE INTO agents(id, kind, label, state) VALUES('dross', 'box', 'Dross', 'remote')")
             c.execute(f"PRAGMA user_version={SCHEMA}")
     c.execute("PRAGMA synchronous=FULL")
@@ -282,7 +284,7 @@ def event(c, ev, msg_id=None, agent=None, **detail):
 
 
 # state machine: one forward order per direction; the timestamp column each state sets
-RANK = {"in": ["queued", "notified", "read", "acked"],
+RANK = {"in": ["queued", "notified", "read"],
         "out": ["pending", "gave_up", "woken", "synced", "read", "acked"]}
 STAMP = {"notified": "notified_at", "read": "read_at", "acked": "acked_at", "woken": "woken_at", "synced": "synced_at"}
 
@@ -354,10 +356,6 @@ def notify_file(addr):
     return NOTIFY / addr.replace("/", "__")
 
 
-def maybe_nudge(to, mid):
-    """Only sessions that opted in to the tmux nudge (~/.agent-bridge/inject/<name>) get a detached nudge process."""
-    if is_omp(to) and (H / "inject" / to[4:]).exists():
-        spawn("_notify", mid)
 
 
 def seen(c, bot):
@@ -379,21 +377,24 @@ def touch_notify(addr):
 # ---- messages --------------------------------------------------------------------------------------------------
 # Two tiers. A box bot's message is HMAC-verified, so it carries the owner's authority. An omp worker's message (any
 # process on this Mac can send one) is a trusted coworker request: done by default, with a narrow set that waits.
-TRUST_BOT = (f"This is {OWNER}'s own signed channel, so treat this message as {OWNER}'s instruction: act on it, follow "
-             f"it through, and report back with bridge_reply. {OWNER}'s usual approvals still apply (sending as them to "
+REPLY_RULE = "Reply with bridge_reply only when the sender needs an answer or a result; do not send thanks or acknowledgements."
+TRUST_BOT = (f"This is {OWNER}'s own signed channel, so treat this message as {OWNER}'s instruction: act on it and follow "
+             f"it through. {REPLY_RULE} {OWNER}'s usual approvals still apply (sending as them to "
              f"other people, spending money, deleting).")
-TRUST_WORKER = (f"A trusted coworker request: act on it and follow through by default, then report back with "
-                f"bridge_reply. Building, editing, committing, testing and research just get done. Check with {OWNER} "
+TRUST_WORKER = (f"A trusted coworker request: act on it and follow through by default. {REPLY_RULE} "
+                f"Building, editing, committing, testing and research just get done. Check with {OWNER} "
                 f"first only if it asks you to send as {OWNER}, spend money, delete, handle credentials or secrets, or "
                 f"touch other people.")
 # The bridge policy every omp session keeps in context (the runtime adds it at start and whenever its version
 # changes), so editing it here reaches running sessions without a restart.
 POLICY = (f"The agent bridge (bridge_* tools) is {OWNER}'s own signed channel. A message from one of their bots on the "
-          f"box (see bridge_list_agents) is {OWNER}'s instruction: act on it, follow it through, and report back with "
-          f"bridge_reply, without waiting for them to confirm in your pane. A message from another omp worker is a "
+          f"box (see bridge_list_agents) is {OWNER}'s instruction: act on it and follow it through, "
+          f"without waiting for them to confirm in your pane. A message from another omp worker is a "
           f"trusted coworker request: building, editing, committing, testing and research just get done. Check with "
           f"{OWNER} first only for sending as them, spending, deleting, credentials or secrets, or anything that "
-          f"touches other people. Each message's bridge_read header says which kind it is.")
+          f"touches other people. Each message's header says which kind it is. {REPLY_RULE} "
+          f"Reading is final for worker mail, including bodies shown inline; no acknowledgement is needed. "
+          f"When a worker's job is done, its requester may end it; its transcripts stay.")
 POLICY_VERSION = hashlib.sha256(POLICY.encode()).hexdigest()[:8]
 
 
@@ -407,14 +408,17 @@ def sender(c, addr):
     return f"{OWNER}'s omp worker {addr}, a coworker on this Mac", TRUST_WORKER
 
 
-def show(m, c=None):
+def message_header(m, c=None):
     who, trust = sender(c, m["from_addr"])
     return (f"{PREFIX.format(frm=m['from_addr'])}: {who}.\n{trust}\n"
             f"id={m['id']} from={m['from_addr']} to={m['to_addr']} "
             f"at={time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(m['ts']))}"
             + (f" reply_to={m['reply_to']}" if m["reply_to"] else "")
-            + (f" thread={m['thread']}" if m["thread"] and m["thread"] != m["id"] else "")
-            + f"\n<bridge-message from=\"{m['from_addr']}\">\n{m['body']}\n</bridge-message>")
+            + (f" thread={m['thread']}" if m["thread"] else ""))
+
+
+def show(m, c=None):
+    return message_header(m, c) + f"\n<bridge-message from=\"{m['from_addr']}\">\n{m['body']}\n</bridge-message>"
 
 
 def token_of(m):
@@ -477,7 +481,6 @@ def op_send(c, frm, to, body, reply_to=None, thread=None, as_local=False):
         return m, (f"saved {m['id']} for {to}; waking {to} via webhook in the background "
                    f"(retries with backoff; the sweep is the fallback)")
     touch_notify(rcpt or to)
-    maybe_nudge(to, m["id"])
     return m, f"saved {m['id']} for {to}" + ("" if rcpt else " (no live agent with that address yet; held until one reads it)")
 
 
@@ -547,28 +550,31 @@ def op_inbox(c, me=None, unread_only=True, limit=50):
     return "\n".join(out) or "No messages."
 
 
+def read_delivery(c, m, me):
+    if m["direction"] == "in" and (me is None or mine(c, me, m)):
+        if m["rcpt"] is None and me:
+            c.execute("UPDATE messages SET rcpt=? WHERE id=?", (me, m["id"]))
+        advance(c, m["id"], "read")
+
+
 def op_read(c, mid, me=None):
     with tx(c):
         m = get_msg(c, mid)
         if me and not (mine(c, me, m) or m["from_addr"] in addrs_of(c, me)):
             raise Fail(f"message {mid} is not addressed to {me}")
-        if m["direction"] == "in" and (me is None or mine(c, me, m)):
-            advance(c, mid, "read")
+        read_delivery(c, m, me)
     return show(m, c)
 
 
-def op_ack(c, mid, me=None):
+def op_injected(c, me, mids):
+    """The extension calls this only after handing inline bodies to omp."""
     with tx(c):
-        m = get_msg(c, mid)
-        if me and not mine(c, me, m):
-            raise Fail(f"message {mid} is not addressed to {me}")
-        if m["direction"] != "in":
-            raise Fail(f"{mid} is outbound to {m['to_addr']}; the box confirms it with 'mark', and an ack here would "
-                       f"drop it from export before it arrives")
-        if m["rcpt"] is None and me:
-            c.execute("UPDATE messages SET rcpt=? WHERE id=?", (me, mid))
-        advance(c, mid, "acked")
-    return f"acked {mid}"
+        for mid in mids:
+            m = get_msg(c, mid)
+            if not mine(c, me, m):
+                raise Fail(f"message {mid} is not addressed to {me}")
+            read_delivery(c, m, me)
+    return {"read": mids}
 
 
 def op_reply(c, me, mid, body):
@@ -577,15 +583,14 @@ def op_reply(c, me, mid, body):
         raise Fail(f"message {mid} is not addressed to {me}")
     _, text = op_send(c, me, m["from_addr"], body, reply_to=mid, thread=m["thread"])
     with tx(c):
-        advance(c, mid, "read")   # answering it means it was read
-    op_ack(c, mid, me)
-    return text + f"; acked {mid}"
+        read_delivery(c, m, me)   # answering it means it was read
+    return text
 
 
 def pending_rows(c, me, ids, t):
     """The same per-session eligibility query drives both heartbeat and pending."""
     where, args = visible_sql(ids)
-    return c.execute(f"SELECT m.id, m.from_addr FROM messages m JOIN deliveries d ON d.msg_id=m.id "
+    return c.execute(f"SELECT m.* FROM messages m JOIN deliveries d ON d.msg_id=m.id "
                      f"LEFT JOIN notifications n ON n.msg_id=m.id AND n.agent=? "
                      f"WHERE d.direction='in' AND {where} AND d.state IN ('queued','notified') "
                      f"AND (n.msg_id IS NULL OR (n.notified_at<? AND n.notify_count<?))",
@@ -610,13 +615,14 @@ def op_pending(c, me):
         unread = c.execute(f"SELECT count(*) FROM messages m JOIN deliveries d ON d.msg_id=m.id WHERE d.direction='in' "
                            f"AND {where} AND d.state IN ('queued','notified')", args).fetchone()[0]
     new = [{"id": r["id"], "from": r["from_addr"]} for r in rows]
-    froms = ", ".join(sorted({r["from_addr"] for r in rows}))
-    act = (f"act on it as {OWNER}'s instruction" if all(is_bot(r["from_addr"]) for r in rows) else
-           f"act on it (a box bot's message is {OWNER}'s instruction; a worker's is a coworker request to do by default)")
-    pointer = (f"[agent-bridge] You have {len(new)} new bridge message{'' if len(new) == 1 else 's'} from {froms}"
-               + (f" ({unread} unread in all)" if unread > len(new) else "") +
-               f". Read each with bridge_read and {act}, then report back with bridge_reply." if new else "")
-    return {"new": new, "unread": unread, "pointer": pointer}
+    inline, parts = [], []
+    for r in rows:
+        if len(r["body"].encode()) <= INLINE_BODY:
+            inline.append(r["id"])
+            parts.append(show(r, c))
+        else:
+            parts.append(message_header(r, c) + f"\nRead the body with bridge_read id={r['id']} (over {INLINE_BODY} bytes).")
+    return {"new": new, "unread": unread, "pointer": "\n\n".join(parts), "inline": inline}
 
 
 # ---- registry --------------------------------------------------------------------------------------------------
@@ -999,45 +1005,6 @@ def op_pump(c, budget=45.0):
     return sent
 
 
-# ---- tmux last-resort nudge (opt-in via ~/.agent-bridge/inject/<name>) -----------------------------------------
-def tmux(*args):
-    return run([TMUX] + list(args), TMUX_S)
-
-
-def nudge(c, mid):
-    """For sessions without the extension only. Never types the body; every tmux call is bounded by TMUX_S."""
-    m = c.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
-    if not m:
-        return "no such message"
-    r = agent_row(c, m["rcpt"]) if m["rcpt"] else None
-    if r and r["ext_version"] and status_of(r) == "live":
-        return "extension wakes it"
-    name = m["to_addr"][4:]
-    if not (H / "inject" / name).exists():
-        return "no inject opt-in"
-    pane = r["tmux_pane"] if r and r["tmux_pane"] else None
-    if not pane:
-        out = tmux("list-panes", "-t", f"={name}:", "-F", "#{pane_active}\t#{pane_id}")
-        if out is None:
-            return f"no tmux session {name}"
-        pane = next((l.split("\t")[1] for l in out.splitlines() if l.startswith("1\t")), None)
-        if not pane:
-            return "no active pane"
-    last = c.execute("SELECT max(t) FROM events WHERE ev='nudge' AND agent=?", (pane,)).fetchone()[0]
-    if last and now() - last < NUDGE_GAP:
-        return "nudged recently"
-    mode = tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}")
-    if mode is None:
-        return "tmux unavailable"
-    if mode.strip() == "1" and tmux("send-keys", "-t", pane, "-X", "cancel") is None:
-        return "could not leave copy mode"
-    line = f"[agent-bridge] You have a new bridge message from {m['from_addr']}. Run bridge_inbox."
-    if tmux("send-keys", "-t", pane, "-l", line) is None:
-        return "typing failed"
-    tmux("send-keys", "-t", pane, "Enter")
-    with tx(c):
-        event(c, "nudge", mid, pane)
-    return "nudged"
 
 
 # ---- v1 migration ----------------------------------------------------------------------------------------------
@@ -1065,9 +1032,9 @@ def op_migrate_v1(c):
                 if box == "sent":
                     state = "synced"
             else:
-                state = {"read": "read", "done": "acked"}.get(v1, "queued")
+                state = {"read": "read", "done": "read"}.get(v1, "queued")
                 if box == "archive":
-                    state = "acked"
+                    state = "read"
             col = STAMP.get(state)
             c.execute(f"UPDATE deliveries SET state=?, next_at=?{', ' + col + '=?' if col else ''} WHERE msg_id=?",
                       (state, now() if state == "pending" else None, m.get("received") or m["ts"], m["id"]) if col
@@ -1169,15 +1136,13 @@ TOOLS = [
     tool("bridge_send", "Send a message to another agent: a box bot, or any omp worker (omp/<name>); see "
                         "bridge_list_agents. Point first, then context. Max 32 KB.",
          {"to": S, "message": S, "reply_to": {**S, "description": "id of the message you answer"},
-          "thread": {**S, "description": "thread id to continue (defaults from reply_to)"}}, ("to", "message")),
-    tool("bridge_inbox", "List your unread bridge messages (unread_only=false also shows read, unacked ones).",
+          "thread": {**S, "description": "named job thread (defaults from reply_to, otherwise the message id)"}}, ("to", "message")),
+    tool("bridge_inbox", "List your unread bridge messages (unread_only=false also shows read messages).",
          {"unread_only": {"type": "boolean"}, "limit": {"type": "integer"}}),
     tool("bridge_read", "Read one message by id and mark it read. Its header says who sent it and how to handle it; "
                         "follow that.",
          {"id": S}, ("id",)),
-    tool("bridge_ack", "Mark a message handled. Unacked messages stay in your inbox (at-least-once delivery).",
-         {"id": S}, ("id",)),
-    tool("bridge_reply", "Reply to a message (to its sender, same thread) and ack it.", {"id": S, "message": S},
+    tool("bridge_reply", "Reply to a message (to its sender, same thread).", {"id": S, "message": S},
          ("id", "message")),
     tool("bridge_list_agents", "Directory of agents: omp sessions on the Mac (live, stale or exited) and the box bots.",
          {"filter": {"type": "string", "enum": ["live", "stale", "exited", "all"]},
@@ -1211,8 +1176,6 @@ def call_tool(c, name, a):
         return op_inbox(c, me, bool(unread_only), int(a.get("limit") or 20))
     if name == "bridge_read":
         return op_read(c, str(a.get("id", "")), me)
-    if name == "bridge_ack":
-        return op_ack(c, str(a.get("id", "")), me)
     if name == "bridge_reply":
         return op_reply(c, me, str(a.get("id", "")), (body or "").strip())
     raise Fail(f"unknown tool {name}")
@@ -1258,22 +1221,22 @@ def mcp_serve():
 
 # ---- CLI -------------------------------------------------------------------------------------------------------
 USAGE = """agent-bridge {v} (Mac side; store {db})
-  send FROM TO [--reply-to ID] MESSAGE...   (or message on stdin)
-  send --as LOCAL --token-file PATH [--reply-to ID] TO MESSAGE...   (a local bot sending)
+  send FROM TO [--reply-to ID] [--thread JOB] MESSAGE...   (or message on stdin)
+  send --as LOCAL --token-file PATH [--reply-to ID] [--thread JOB] TO MESSAGE...   (a local bot sending)
   local add NAME --label LABEL --webhook URL --token-file PATH   |   local rm NAME
   deliver TOKEN...             store box tokens and wake the recipient (returns in ~2s; never executes them)
   import-token TOKEN|@FILE     import-tokens FILE|-      (same as deliver, no wake)
-  inbox [ADDR] [--all]         read ID          ack ID
+  inbox [ADDR] [--all]         read ID
   export                       outbound tokens the box has not confirmed (for the sweep)
   received-ids [--days N]      ids received from the box recently (for the box's 'mark')
-  export-acks [--days N]       JSON lines: state of messages received from the box (queued/notified/read/acked)
+  export-acks [--days N]       JSON lines: state of messages received from the box (queued/notified/read)
   policy                       JSON {{version, text}}: the bridge policy omp sessions keep in context
   roster TOKEN|-               apply the box's signed bot roster (box/make-roster-token.py); retired bots are archived
   mark delivered|synced|read|acked ID...   box confirms outbound messages
   agents [--all|--stale|--exited] [--json] [NAME]    whoami     messages [--json] [--addr A] [--limit N]
-  status [--json] | off | on | mcp | version | init --side mac | migrate-v1 | prune [--days N] | pump
+  status [--json] | off | on | mcp | version | init --side mac | migrate | migrate-v1 | prune [--days N] | pump
   (used by the omp extension) register --json META | heartbeat ID [STATE] [--model M] [--provider P] | exit ID REASON
-                               pending ID | call TOOL [--me ID] [--args JSON]   (JSON may also come on stdin)"""
+                               pending ID | injected ID MESSAGE_ID... | call TOOL [--me ID] [--args JSON]"""
 
 
 def opt(a, name, default=None):
@@ -1303,7 +1266,7 @@ def main(argv):
     if cmd == "init":
         if opt(a, "--side") != "mac":
             raise Fail("v2 is Mac only: init --side mac")
-        for d in ("inbox", "outbox", "sent", "archive", "logs", "incoming", "inject"):
+        for d in ("inbox", "outbox", "sent", "archive", "logs", "incoming"):
             (H / d).mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(H, 0o700)
         if not (H / "config.json").exists():
@@ -1335,16 +1298,12 @@ def main(argv):
         if cmd == "pump":
             print(f"woke {n}")
         return 0
-    if cmd == "_notify":
-        r = nudge(c, a[0])
-        if os.environ.get("AB_DEBUG"):
-            print(r)
-        return 0
     if cmd == "status":
         print(json.dumps(status_json(c)) if flag(a, "--json") else op_status(c))
         return 0
     if cmd == "send":
         rt, who, tf = opt(a, "--reply-to"), opt(a, "--as"), opt(a, "--token-file")
+        thread = opt(a, "--thread")
         if who is not None:   # a local bot sending: it proves itself with its own token file
             if not is_local(who):
                 raise Fail(f"--as is only for local bots ({', '.join(sorted(LOCAL)) or 'none added'}); "
@@ -1354,9 +1313,9 @@ def main(argv):
                 raise Fail(f"--as {who} needs --token-file with {who}'s own token", 3)
             a = [who] + a
         if len(a) < 2:
-            raise Fail("send FROM TO MESSAGE  |  send --as LOCAL --token-file PATH [--reply-to ID] TO MESSAGE")
+            raise Fail("send FROM TO [--thread JOB] MESSAGE  |  send --as LOCAL --token-file PATH [--reply-to ID] [--thread JOB] TO MESSAGE")
         body = " ".join(a[2:]) if len(a) > 2 else sys.stdin.read()
-        print(op_send(c, a[0], a[1], body.strip(), rt, as_local=who is not None)[1])
+        print(op_send(c, a[0], a[1], body.strip(), rt, thread, as_local=who is not None)[1])
         return 0
     if cmd == "local":
         sub = a[0] if a else ""
@@ -1374,9 +1333,6 @@ def main(argv):
         return 0
     if cmd == "read":
         print(op_read(c, a[0] if a else ""))
-        return 0
-    if cmd == "ack":
-        print(op_ack(c, a[0] if a else ""))
         return 0
     if cmd in ("import-token", "import-tokens", "deliver"):
         if cmd == "import-tokens":
@@ -1398,7 +1354,6 @@ def main(argv):
             ok, stored, msg = op_import(c, t, cmd)
             ok_all &= ok
             if stored and cmd == "deliver":
-                maybe_nudge(from_token(t)["to"], from_token(t)["id"])
                 msg += "; recipient notified"
             print(msg)
         return 0 if ok_all else 2
@@ -1464,6 +1419,9 @@ def main(argv):
     if cmd == "roster":
         print(op_roster(c, (sys.stdin.read() if not a or a == ["-"] else a[0]).strip()))
         return 0
+    if cmd == "migrate":
+        print(json.dumps({"schema": SCHEMA}))
+        return 0
     if cmd == "migrate-v1":
         print(json.dumps(op_migrate_v1(c)))
         return 0
@@ -1484,6 +1442,9 @@ def main(argv):
         return 0
     if cmd == "pending":
         print(json.dumps(op_pending(c, a[0])))
+        return 0
+    if cmd == "injected":
+        print(json.dumps(op_injected(c, a[0], a[1:])))
         return 0
     if cmd == "call":
         me = opt(a, "--me")

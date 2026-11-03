@@ -1,7 +1,7 @@
 // agent-bridge omp extension: a stable shim. Symlinked into ~/.omp/agent/extensions/; source in this repo.
 // Every main omp session, however it was started, registers with the bridge, heartbeats, and is woken natively when
-// mail arrives (a one-line pointer, never the body). The behavior lives in bridge-runtime.ts, which this shim
-// re-imports whenever that file changes, so updates reach running sessions within one poll (3 s) and no /reload.
+// mail arrives (inline bodies up to the CLI's cap, pointers for larger messages). Behavior lives in bridge-runtime.ts,
+// which this shim re-imports when changed. Runtime updates reach running sessions within one poll (3 s), without /reload.
 // Keep this file small and unchanging: hooks and tool registrations are fixed when omp loads it.
 // @ts-nocheck
 import { realpathSync, statSync } from "node:fs";
@@ -57,7 +57,7 @@ export default function agentBridge(pi) {
   pi.on("session_shutdown", async (e, ctx) => main(ctx) && (await runtime()).shutdown(e));
 
   // Tool names, parameters and descriptions are fixed at load, so they say only what never changes; how to treat a
-  // message comes with the message itself (bridge_read) and from the bridge policy the runtime keeps in context.
+  // message comes with its header (inline or bridge_read) and from the bridge policy the runtime keeps in context.
   const tool = (name, label, description, parameters) =>
     pi.registerTool({
       name,
@@ -79,13 +79,13 @@ export default function agentBridge(pi) {
       to: z.string().describe("a box bot name or omp/<name>"),
       message: z.string(),
       reply_to: z.string().optional().describe("id of the message you answer"),
-      thread: z.string().optional().describe("thread id to continue (defaults from reply_to)"),
+      thread: z.string().optional().describe("named job thread (defaults from reply_to, otherwise the message id)"),
     }),
   );
   tool(
     "bridge_inbox",
     "Bridge Inbox",
-    "List bridge messages for this session (unread by default; unread_only=false also shows read, unacked ones).",
+    "List bridge messages for this session (unread by default; unread_only=false also shows read messages).",
     z.object({ unread_only: z.boolean().optional(), limit: z.number().int().positive().optional() }),
   );
   tool(
@@ -95,15 +95,9 @@ export default function agentBridge(pi) {
     z.object({ id }),
   );
   tool(
-    "bridge_ack",
-    "Bridge Ack",
-    "Mark a bridge message handled. Unacked messages stay in the inbox (at-least-once delivery).",
-    z.object({ id }),
-  );
-  tool(
     "bridge_reply",
     "Bridge Reply",
-    "Reply to a bridge message (to its sender, same thread) and ack it.",
+    "Reply to a bridge message (to its sender, same thread).",
     z.object({ id, message: z.string() }),
   );
   tool(

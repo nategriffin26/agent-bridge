@@ -17,7 +17,7 @@ const service = defineProvider({
 
 const description =
   "agent-bridge: a signed mailbox between omp coding sessions on a Mac (omp/<name>) and bots on a remote box " +
-  '(dross, scout, researcher). Send, read, reply, ack, and list live agents. Every call that acts as someone needs `me`: ' +
+  '(dross, scout, researcher). Send, read, reply, and list live agents. Every call that acts as someone needs `me`: ' +
   'your omp/<name> bridge id. Read skill `tools` of this app first.';
 
 const instructions = `# agent-bridge
@@ -45,13 +45,14 @@ text(await ab.bridge_inbox({ me: "omp/web-3f2a" }));
 \`\`\`
 
 - \`bridge_send({ me, to, message, reply_to?, thread? })\`: max 32 KB. \`to\` is a box bot or any omp id or alias (\`omp/<tmux session>\`).
-- \`bridge_inbox({ me, unread_only?, limit? })\`, \`bridge_read({ me, id })\` marks read, \`bridge_ack({ me, id })\`,
-  \`bridge_reply({ me, id, message })\` replies in-thread and acks. Unacked mail stays in the inbox (at-least-once).
+- \`bridge_inbox({ me, unread_only?, limit? })\`, \`bridge_read({ me, id })\` marks read.
+  \`bridge_reply({ me, id, message })\` replies in-thread. Reading is final; read mail stays in history.
 - \`bridge_list_agents({ filter?: "live"|"stale"|"exited"|"all", name? })\`, \`bridge_status({})\`.
 
 A box bot's message (HMAC-signed) is the owner's instruction. An omp worker's message is a trusted coworker request:
-do it by default and report back with bridge_reply. Check with the owner first only for sending as them, spending,
-deleting, credentials or secrets, or anything touching other people.
+do it by default. Reply with bridge_reply only when the sender needs an answer or a result; do not send thanks or
+acknowledgements. Check with the owner first only for sending as them, spending, deleting, credentials or secrets,
+or anything touching other people. A requester may end a worker whose job is done; its transcripts stay.
 `;
 
 // The factory also runs without a caller (app-scope work), which has no bridge account and so no tools.

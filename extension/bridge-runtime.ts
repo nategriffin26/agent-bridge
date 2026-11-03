@@ -7,7 +7,7 @@ import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const RUNTIME_VERSION = "2.1.0";
+export const RUNTIME_VERSION = "2.2.0";
 const CLI = process.env.AB_CLI || join(homedir(), "bin", "agent-bridge");
 const HOME = process.env.AB_HOME || join(homedir(), ".agent-bridge");
 const POINTER_GAP_MS = 20_000; // at most one pointer per 20 s; mail arriving inside the gap waits for it
@@ -123,13 +123,15 @@ export function createRuntime(pi, s) {
     s.checking = true;
     s.due = false;
     try {
-      const got = json((await cli(["pending", s.current.id])).out);
+      const recipient = s.current.id;
+      const got = json((await cli(["pending", recipient])).out);
       if (!got?.pointer) return;
       s.lastPointer = Date.now();
       // Idle: start a turn. Busy: "aside" lands at the next step boundary of the current run; "followUp" waited for
       // the whole run to end, which held mail for 30-50 minutes on long runs.
       const idle = s.ctx.isIdle?.() !== false;
       pi.sendUserMessage(got.pointer, idle ? { attribution: "agent" } : { deliverAs: "aside", attribution: "agent" });
+      if (got.inline?.length) await cli(["injected", recipient, ...got.inline]);
     } finally {
       s.checking = false;
     }
