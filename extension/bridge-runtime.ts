@@ -7,12 +7,16 @@ import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const RUNTIME_VERSION = "2.2.0";
+export const RUNTIME_VERSION = "2.2.1";
 const CLI = process.env.AB_CLI || join(homedir(), "bin", "agent-bridge");
 const HOME = process.env.AB_HOME || join(homedir(), ".agent-bridge");
 const POINTER_GAP_MS = 20_000; // at most one pointer per 20 s; mail arriving inside the gap waits for it
 
 export function createRuntime(pi, s) {
+  const version = s.messageEndHook ? RUNTIME_VERSION : `${RUNTIME_VERSION}-legacy-shim`;
+  s.pendingInline ??= [];
+  s.deliveryGeneration ??= 0;
+
   async function cli(args, timeout = 5_000) {
     try {
       const r = await pi.exec(CLI, args, { timeout });
@@ -44,7 +48,7 @@ export function createRuntime(pi, s) {
       cwd: ctx.cwd,
       pid: process.pid,
       state: s.state,
-      ext_version: RUNTIME_VERSION,
+      ext_version: version,
       ab_self: process.env.AB_SELF || "",
       tmux: process.env.TMUX || "",
       tmux_pane: process.env.TMUX_PANE || "",
@@ -85,7 +89,7 @@ export function createRuntime(pi, s) {
       "heartbeat", s.current.id, s.state,
       ...(m.model ? ["--model", m.model] : []),
       ...(m.provider ? ["--provider", m.provider] : []),
-      "--ext", RUNTIME_VERSION,
+      "--ext", version,
     ]);
     const got = r.ok ? json(r.out) : undefined;
     if (got?.reregister) await ensureRegistered(s.ctx);
@@ -124,22 +128,45 @@ export function createRuntime(pi, s) {
     s.due = false;
     try {
       const recipient = s.current.id;
+      const generation = s.deliveryGeneration;
       const got = json((await cli(["pending", recipient])).out);
+      if (generation !== s.deliveryGeneration || recipient !== s.current?.id) return;
       if (!got?.pointer) return;
       s.lastPointer = Date.now();
       // Idle: start a turn. Busy: "aside" lands at the next step boundary of the current run; "followUp" waited for
       // the whole run to end, which held mail for 30-50 minutes on long runs.
       const idle = s.ctx.isIdle?.() !== false;
+      if (!idle && got.inline?.length) {
+        s.pendingInline.push({ recipient, text: got.pointer, ids: got.inline });
+      }
       pi.sendUserMessage(got.pointer, idle ? { attribution: "agent" } : { deliverAs: "aside", attribution: "agent" });
-      if (got.inline?.length) await cli(["injected", recipient, ...got.inline]);
+      if (idle && got.inline?.length) await cli(["injected", recipient, ...got.inline]);
     } finally {
       s.checking = false;
     }
   }
 
+  function userMessageText(message) {
+    if (message?.role !== "user") return;
+    return typeof message.content === "string" ? message.content :
+      message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+  }
+
+  // A busy aside is only queued by sendUserMessage; this event confirms its user record entered context.
+  async function messageEnd(event) {
+    if (!s.current || !s.pendingInline.length) return;
+    const text = userMessageText(event.message);
+    const index = s.pendingInline.findIndex((delivery) => delivery.recipient === s.current.id && delivery.text === text);
+    if (index < 0) return;
+    const [delivery] = s.pendingInline.splice(index, 1);
+    await cli(["injected", delivery.recipient, ...delivery.ids]);
+  }
+
   return {
-    version: RUNTIME_VERSION,
+    version,
     async start(ctx) {
+      s.deliveryGeneration += 1;
+      s.pendingInline = [];
       s.ctx = ctx;
       s.state = ctx?.isIdle?.() === false ? "working" : "idle";
       await ensureRegistered(ctx);
@@ -150,9 +177,16 @@ export function createRuntime(pi, s) {
       s.ctx = ctx;
       setState(s.blocked > 0 ? "blocked" : "working");
     },
-    agentEnd() {
+    async agentEnd() {
       s.blocked = 0;
       setState("idle");
+      // Old shims cannot forward message_end. A turn ending alone is not proof: abort can leave asides queued.
+      if (!s.messageEndHook && s.current && s.pendingInline.length) {
+        for (const entry of s.ctx.sessionManager.getBranch()) {
+          if (!s.pendingInline.length) break;
+          if (entry.type === "message") await messageEnd({ message: entry.message });
+        }
+      }
       if (s.due) void checkMail();
     },
     askStart() {
@@ -164,6 +198,8 @@ export function createRuntime(pi, s) {
       setState(s.blocked > 0 ? "blocked" : "working");
     },
     async shutdown(event) {
+      s.deliveryGeneration += 1;
+      s.pendingInline = [];
       if (!s.current) return;
       // omp 18.12 sends no reason. Mark exited anyway: a /reload or /resume rebinds and registers again at once,
       // and /new moves to a new id. Should a later omp name a non-quit reason, skip those.
@@ -173,6 +209,7 @@ export function createRuntime(pi, s) {
     },
     heartbeat,
     poll,
+    messageEnd,
     async call(name, params, ctx) {
       if (!s.current) await ensureRegistered(ctx);
       if (!s.current) throw new Error("agent-bridge: this session is not registered (is ~/bin/agent-bridge installed?)");

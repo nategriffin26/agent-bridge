@@ -515,6 +515,20 @@ class Bridge(unittest.TestCase):
         self.db().execute("UPDATE notifications SET notified_at=notified_at-1000").connection.commit()
         self.assertEqual([m["id"] for m in json.loads(self.ab("pending", me).stdout)["new"]], [mids[2]])
 
+    def test_injected_alias_claim_does_not_rollback_other_messages(self):
+        a = self.register("s1", cwd="/tmp/shared")["id"]
+        b = self.register("s2", cwd="/tmp/shared")["id"]
+        own = self.ab("send", "omp/sender", b, "only for b").stdout.split()[1]
+        shared = self.ab("send", "omp/sender", "omp/shared", "shared question").stdout.split()[1]
+        pending = json.loads(self.ab("pending", b).stdout)
+        self.assertEqual(pending["inline"], [own, shared])
+        self.ab("pending", a)
+        self.ab("injected", a, shared)
+        self.assertEqual(json.loads(self.ab("injected", b, *pending["inline"]).stdout), {"read": [own]})
+        self.assertEqual([self.state(mid) for mid in (own, shared)], ["read", "read"])
+        self.assertEqual(self.db().execute("SELECT rcpt FROM messages WHERE id=?", (shared,)).fetchone()[0], a)
+        self.assertEqual(json.loads(self.ab("injected", b, *pending["inline"]).stdout), {"read": []})
+
     def test_named_threads_survive_cli_tool_and_reply(self):
         a = self.register("s1", cwd="/tmp/a")["id"]
         b = self.register("s2", cwd="/tmp/b")["id"]

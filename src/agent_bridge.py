@@ -16,7 +16,7 @@ import urllib.error, urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 SCHEMA = 4
 MAX_BODY = 32 * 1024
 INLINE_BODY = 16 * 1024               # UTF-8 bytes; larger bodies are fetched with bridge_read
@@ -554,7 +554,8 @@ def read_delivery(c, m, me):
     if m["direction"] == "in" and (me is None or mine(c, me, m)):
         if m["rcpt"] is None and me:
             c.execute("UPDATE messages SET rcpt=? WHERE id=?", (me, m["id"]))
-        advance(c, m["id"], "read")
+        return advance(c, m["id"], "read")
+    return False
 
 
 def op_read(c, mid, me=None):
@@ -568,13 +569,15 @@ def op_read(c, mid, me=None):
 
 def op_injected(c, me, mids):
     """The extension calls this only after handing inline bodies to omp."""
+    marked = []
     with tx(c):
         for mid in mids:
             m = get_msg(c, mid)
             if not mine(c, me, m):
-                raise Fail(f"message {mid} is not addressed to {me}")
-            read_delivery(c, m, me)
-    return {"read": mids}
+                continue
+            if read_delivery(c, m, me):
+                marked.append(mid)
+    return {"read": marked}
 
 
 def op_reply(c, me, mid, body):

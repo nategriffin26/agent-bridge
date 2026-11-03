@@ -91,7 +91,7 @@ InboundWake:
 - Two messages (`Msgs = {m1, m2}`), `MaxNotify = 3` as in `MAX_NOTIFY`, at most `MaxFaults = 2` faults in all (lost pointers, failed `pending` calls, rebinds).
 - Fewer than `MAX_NOTIFY` pointers to one message are lost. With `MAX_NOTIFY` losses the design stops re-pointing on purpose, so `MaxFaults` must stay below `MaxNotify`.
 - The heartbeat and poll timers keep firing, CLI calls finish, and every notify-file touch moves its mtime forward.
-- A pointer handed to `pi.sendUserMessage` reaches the session; whether the agent then acts on it is outside the model.
+- The model assumes a pointer handed to `pi.sendUserMessage` reaches the session. Busy aside queueing does not itself satisfy that assumption: queue loss, `message_end` confirmation and the legacy-shim transcript fallback are covered by runtime tests, not this model. Whether the agent then acts on the message is also outside the model.
 
 InboundRouting:
 - Two sessions `{a, b}`, both carrying the alias; one alias message `m1`; one message `m2` to `a`'s exact id; `MaxNotify = 3`; at most `MaxFaults = 1` failed `pending` call.

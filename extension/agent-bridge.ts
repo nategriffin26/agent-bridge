@@ -13,7 +13,7 @@ const HEARTBEAT_MS = 30_000;
 const POLL_MS = 3_000;
 
 // Shared across this process's runtimes (omp rebinds extensions on /reload, /new, /resume, /fork).
-const s = { state: "idle", blocked: 0, lastStamp: 0, lastPointer: 0, due: false, checking: false };
+const s = { state: "idle", blocked: 0, lastStamp: 0, lastPointer: 0, due: false, checking: false, messageEndHook: true };
 
 export default function agentBridge(pi) {
   const z = pi.zod;
@@ -52,6 +52,7 @@ export default function agentBridge(pi) {
   pi.on("session_switch", async (_e, ctx) => start(ctx));
   pi.on("agent_start", async (_e, ctx) => main(ctx) && (await runtime()).agentStart(ctx));
   pi.on("agent_end", async (_e, ctx) => main(ctx) && (await runtime()).agentEnd());
+  pi.on("message_end", async (e, ctx) => main(ctx) && (await runtime()).messageEnd(e));
   pi.on("tool_execution_start", async (e, ctx) => e?.toolName === "ask" && main(ctx) && (await runtime()).askStart());
   pi.on("tool_execution_end", async (e, ctx) => e?.toolName === "ask" && main(ctx) && (await runtime()).askEnd());
   pi.on("session_shutdown", async (e, ctx) => main(ctx) && (await runtime()).shutdown(e));
