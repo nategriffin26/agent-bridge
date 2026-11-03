@@ -4,7 +4,7 @@
 (* bound to a session that died, exited or was pruned reaches a session   *)
 (* that still carries the alias, and the per-session pointer budget lets  *)
 (* that session be pointed at it; mail is never taken from a live owner,  *)
-(* from its exact id, or once read or acked.                               *)
+(* from its exact id, or once read.                                        *)
 (*                                                                         *)
 (* Every session carries the one alias (omp/work). Python is             *)
 (* src/agent_bridge.py; each Python action is one `with tx(c)` block.     *)
@@ -29,7 +29,7 @@ Msgs == AliasMsgs \cup ExactMsgs
 VARIABLES
   life,    \* the agents row as status_of sees it: "none" (never registered), "live", "stale" (dead pid or
            \* heartbeat_at older than STALE_AFTER), "exited" (state='exited'), "gone" (archived by op_prune)
-  dstate,  \* deliveries.state: "none" (not stored yet), "queued", "notified", "read", "acked"
+  dstate,  \* deliveries.state: "none" (not stored yet), "queued", "notified", "read"
   rcpt,    \* messages.rcpt
   ncount,  \* notifications.notify_count for (msg_id, agent); 0 = no row
   old,     \* notifications.notified_at < now - RENOTIFY_AFTER for (msg_id, agent)
@@ -41,7 +41,7 @@ vars == <<life, dstate, rcpt, ncount, old, hb, pend, faults>>
 
 TypeOK ==
   /\ life \in [Sessions -> {"none", "live", "stale", "exited", "gone"}]
-  /\ dstate \in [Msgs -> {"none", "queued", "notified", "read", "acked"}]
+  /\ dstate \in [Msgs -> {"none", "queued", "notified", "read"}]
   /\ rcpt \in [Msgs -> Sessions \cup {Null}]
   /\ ncount \in [Msgs -> [Sessions -> 0..MaxNotify]]
   /\ old \in [Msgs -> [Sessions -> BOOLEAN]]
@@ -73,7 +73,7 @@ Due(r, m, s) == /\ Visible(r, m, s) /\ Unread(m)
                    \/ old[m][s] /\ ncount[m][s] < MaxNotify
 
 \* release_alias_mail: unread alias mail whose rcpt row is missing or not live (in agents rows l, after the
-\* transaction's own writes) goes back to rcpt NULL. Exact-id, read and acked mail never moves.
+\* transaction's own writes) goes back to rcpt NULL. Exact-id and read mail never moves.
 Released(l) == [m \in Msgs |-> IF /\ m \in AliasMsgs /\ Unread(m) /\ rcpt[m] # Null
                                   /\ l[rcpt[m]] # "live"
                                THEN Null ELSE rcpt[m]]
@@ -95,16 +95,16 @@ Store(m) ==
   /\ rcpt' = [rcpt EXCEPT ![m] = Resolve(m)]
   /\ UNCHANGED <<life, ncount, old, hb, pend, faults>>
 
-\* op_read (bridge_read by the recipient, or the operator's `read`): advance to 'read'
+\* Operator's op_read: advance to 'read' without binding a session.
 Read(m) ==
   /\ Unread(m)
   /\ dstate' = [dstate EXCEPT ![m] = "read"]
   /\ UNCHANGED <<life, rcpt, ncount, old, hb, pend, faults>>
 
-\* op_ack by session s (bridge_ack, bridge_reply): mine(); rcpt NULL becomes s; advance to 'acked'
-Ack(m, s) ==
+\* read_delivery by session s (bridge_read, bridge_reply, injected): rcpt NULL becomes s; advance to 'read'
+ReadBySession(m, s) ==
   /\ Live(s) /\ Visible(rcpt, m, s) /\ dstate[m] \in {"queued", "notified", "read"}
-  /\ dstate' = [dstate EXCEPT ![m] = "acked"]
+  /\ dstate' = [dstate EXCEPT ![m] = "read"]
   /\ rcpt' = IF rcpt[m] = Null THEN [rcpt EXCEPT ![m] = s] ELSE rcpt
   /\ UNCHANGED <<life, ncount, old, hb, pend, faults>>
 
@@ -197,7 +197,7 @@ Age(m, s) ==
 
 Next ==
   \/ \E m \in Msgs : Store(m) \/ Read(m)
-  \/ \E m \in Msgs, s \in Sessions : Ack(m, s) \/ Age(m, s)
+  \/ \E m \in Msgs, s \in Sessions : ReadBySession(m, s) \/ Age(m, s)
   \/ Prune
   \/ \E s \in Sessions :
        \/ Register(s) \/ Die(s) \/ Exit(s) \/ Inbox(s)
@@ -210,10 +210,10 @@ Fairness ==
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
-(* m no longer needs a pointer to s: read or acked, already claimed for s by op_pending, bound to another
+(* m no longer needs a pointer to s: read, already claimed for s by op_pending, bound to another
    session that is live, or addressed to another session's exact id. *)
 Served(m, s) ==
-  \/ dstate[m] \in {"read", "acked"}
+  \/ dstate[m] = "read"
   \/ ncount[m][s] > 0
   \/ rcpt[m] \notin {Null, s} /\ Live(rcpt[m])
   \/ m \in ExactMsgs /\ ExactTo # s
@@ -224,11 +224,11 @@ Served(m, s) ==
 Routed == \A m \in Msgs, s \in Sessions :
             <>[]Live(s) => <>[](dstate[m] # "none" => Served(m, s))
 
-(* The safety property: messages.rcpt changes only when insert sets it, when op_ack takes unresolved mail, or
+(* The safety property: messages.rcpt changes only when insert sets it, when a session reads unresolved mail, or
    when unread alias mail leaves an owner that is not live after the transaction. *)
 RcptMove(m) ==
   \/ dstate[m] = "none"
-  \/ rcpt[m] = Null /\ dstate'[m] = "acked"
+  \/ rcpt[m] = Null /\ dstate'[m] = "read"
   \/ /\ rcpt'[m] = Null /\ m \in AliasMsgs /\ Unread(m)
      /\ life'[rcpt[m]] # "live"
 NoSteal == [][\A m \in Msgs : rcpt'[m] # rcpt[m] => RcptMove(m)]_vars

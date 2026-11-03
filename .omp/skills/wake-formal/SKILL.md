@@ -1,6 +1,6 @@
 ---
 name: wake-formal
-description: Model checks that every message stored for an omp session wakes it (formal/InboundWake.tla) and that shared-alias mail left on a dead, exited or pruned session reaches a live carrier of the alias (formal/InboundRouting.tla), both TLA+/TLC. Use before committing any change to inbound delivery - insert, resolve, status_of, visible_sql, pending_rows, release_alias_mail, op_import, op_send, touch_notify, op_inbox, op_pending, op_heartbeat, op_read, op_ack, op_register, op_exit, op_prune or the notifications table in src/agent_bridge.py, or poll/checkMail/heartbeat/register/shutdown in extension/bridge-runtime.ts and the timers in extension/agent-bridge.ts - or to check the models still match that code.
+description: Model checks that every message stored for an omp session wakes it (formal/InboundWake.tla) and that shared-alias mail left on a dead, exited or pruned session reaches a live carrier of the alias (formal/InboundRouting.tla), both TLA+/TLC. Use before committing any change to inbound delivery - insert, resolve, status_of, visible_sql, pending_rows, release_alias_mail, op_import, op_send, touch_notify, op_inbox, op_pending, op_heartbeat, op_read, read_delivery, op_injected, op_register, op_exit, op_prune or the notifications table in src/agent_bridge.py, or poll/checkMail/heartbeat/register/shutdown in extension/bridge-runtime.ts and the timers in extension/agent-bridge.ts - or to check the models still match that code.
 ---
 
 # Inbound wake and routing, model checked
@@ -8,7 +8,7 @@ description: Model checks that every message stored for an omp session wakes it 
 Two models:
 
 - **InboundWake.** Every message stored for an omp session is pointed out to that session at least once (a pointer naming it reaches the session through `pi.sendUserMessage`), unless the session read it first. Harm: a box bot's instruction or a coworker's request sits in the store while the session it was sent to never hears about it.
-- **InboundRouting.** A surviving session eventually claims a pointer for unread alias mail left by a dead owner, regardless of another carrier's notification count. Exact-ID mail stays with its addressee; live owners keep bound mail; read and acked mail is not released. Harm: a shared-alias message remains invisible after its owner crashes, or another session takes mail it does not own.
+- **InboundRouting.** A surviving session eventually claims a notification for unread alias mail left by a dead owner, regardless of another carrier's notification count. Exact-ID mail stays with its addressee; live owners keep bound mail; read mail is not released. Harm: a shared-alias message remains invisible after its owner crashes, or another session takes mail it does not own.
 
 ## Run it
 
@@ -17,16 +17,16 @@ formal/check.sh                  # both models
 formal/check.sh InboundRouting   # one model
 ```
 
-Last full run: InboundWake 35 s / 1,016,155 distinct states; InboundRouting 9 min 48 s / 8,774,437 distinct states (18 workers, concurrent mutation checks). The first run downloads TLA+ tools 1.7.4 into `local/tla/` (gitignored, sha256 pinned in the script); it needs Java 11+ and curl.
+Last full run (2026-11-02): InboundWake 36 s / 1,016,155 distinct states; InboundRouting 6 min 26 s / 6,644,621 distinct states, both passed with 18 workers. The first run downloads TLA+ tools 1.7.4 into `local/tla/` (gitignored, sha256 pinned in the script); it needs Java 11+ and curl.
 
 - Pass: each model prints `Model checking completed. No error has been found.`; the script ends `formal/check.sh: all models pass: ...` and exits 0.
 - Property broken: `Error: Temporal properties were violated.` (a liveness property: `Woken`, `Routed`) or `Error: Action property NoSteal is violated.`, followed by numbered states; a liveness trace ends in `Back to state N`. The script ends `formal/check.sh: failed: <model>` and exits 1.
 - `Invariant TypeOK is violated`, a parse error, or a deadlock report is a broken model, not a bug in the code.
 - A JVM crash (`SIGBUS`, `hs_err_pid*.log`) is the JVM; delete the log and rerun.
 
-## What the models cover (sync commit 61b8f40)
+## What the models cover (sync commit 2b680fc)
 
-Both models describe the files below as they were at commit `61b8f40`.
+The models describe the delivery and routing behavior at `2b680fc`. Worker reads now bind unresolved recipients and terminate delivery; there is no inbound ack state. The read/injection boundary is tested against the runtime separately, as noted below.
 
 ### InboundWake
 
@@ -43,14 +43,14 @@ One recipient session with a fixed bridge id; the message's `rcpt` is that id.
 | `PendingTx` | `op_pending`'s transaction: `release_alias_mail` (no effect on this session's own mail), claims rows, upserts `notifications`, sets `deliveries.state='notified'` |
 | `HeartbeatTx` | `op_heartbeat`'s transaction: `release_alias_mail`, then `len(pending_rows)` |
 | `CheckMail(d)` | `checkMail` in `extension/bridge-runtime.ts` up to its `await` (guards `s.current`, `s.checking`, `POINTER_GAP_MS`) |
-| `PendingReturn` | `checkMail` after the `await`: pointer, `s.lastPointer`, `finally` |
+| `PendingReturn` | `checkMail` after the pending await: notification, `s.lastPointer`; completion of the injected write is abstracted |
 | `PendingFail` | `cli(["pending"])` failing before the transaction (exit 4 busy store, 5 s timeout) |
 | `PendingLost` | the transaction committed but the pointer never arrives (timeout after commit, rebind mid-call) |
 | `HeartbeatReturn` | `heartbeat` after the `await`: `got.pending > 0` calls `checkMail` |
 | `Poll`, `unseen`, `lastZero` | `poll`: notify file mtime against `s.lastStamp`, `s.due` |
 | `gap`, `GapEnds` | `Date.now() - s.lastPointer < POINTER_GAP_MS` |
 | `Age(m)` | `RENOTIFY_AFTER` passing after this session's `notifications.notified_at` |
-| `Read(m)` | `op_read` (`bridge_read`) advancing to `read` |
+| `Read(m)` | `read_delivery` via `bridge_read`, `bridge_reply` or `injected` advancing to `read` |
 | `Unbind`, `Register` | `shutdown` clearing `s.current`; `start` -> `register` setting `s.current` and `s.lastStamp = 0` (the shared `s` in `extension/agent-bridge.ts` survives) |
 | `Fairness` | `setInterval` timers in `extension/agent-bridge.ts` (`HEARTBEAT_MS`, `POLL_MS`), CLI calls finishing, time passing |
 
@@ -68,8 +68,8 @@ Every session carries one alias (`omp/work` in the replay below). The extension 
 | `Released(l)` | `release_alias_mail`: unread alias mail (`rcpt != to_addr`) whose `rcpt` row is missing or not live goes to `rcpt=NULL`; `l` is the agents rows after the transaction's own writes |
 | `Resolve(m)` | `resolve` in `insert`: the exact id when its row exists; the alias when exactly one live session carries it |
 | `Store(m)` | `insert` inside `op_send` / `op_import` |
-| `Read(m)` | `op_read` (`bridge_read`, or the operator's `read`) |
-| `Ack(m, s)` | `op_ack` by session `s` (`bridge_ack`, `bridge_reply`): `rcpt` NULL becomes `s`, state `acked` |
+| `Read(m)` | Operator's `op_read`, without a session id |
+| `ReadBySession(m, s)` | `read_delivery` via `bridge_read`, `bridge_reply` or `injected`: unresolved `rcpt` becomes `s`, state `read` |
 | `Register(s)` | `op_register`'s transaction: the row, then `release_alias_mail(aliases)` |
 | `Die(s)` | a kill, a crash, or `shutdown`'s 1.5 s `cli exit` failing: no write; `status_of` turns `stale` |
 | `Exit(s)` | `op_exit`'s transaction: `state='exited'`, then `release_alias_mail(aliases)` |
@@ -101,7 +101,7 @@ InboundRouting:
 
 ## Not covered
 
-The tmux nudge, outbound mail (the webhook pump's sends, `export`, `mark`), the box side, signing, the `events`-to-`notifications` migration in `connect`, three or more sessions sharing an alias, several aliases per session, and the timings themselves (only their order). A pass covers the models under these bounds, not the system.
+Outbound mail (the webhook pump's sends, `export`, `mark`), the box side, signing, migrations, three or more sessions sharing an alias, several aliases per session, and the timings themselves (only their order). Inline body selection and the injection-before-read ordering are tested by `tests/runtime.test.ts`, not modeled here; `Read` remains an independent action. A pass covers the models under these bounds, not the system.
 
 ## A counterexample: real bug or modeling error
 
@@ -144,7 +144,7 @@ kill $PA                                         # Die(a) by dead pid
 ab heartbeat "$B"                                # HeartbeatTx(b): {"pending": N}
 ab pending "$B"                                  # PendingTx(b): "new" lists the claimed ids
 ab inbox "$B"                                    # Inbox(b)
-ab call bridge_ack --me "$B" --args '{"id":"<id>"}'   # Ack(m, b)
+ab call bridge_read --me "$B" --args '{"id":"<id>"}'   # ReadBySession(m, b)
 sql "UPDATE notifications SET notified_at=notified_at-1000 WHERE agent='$A'"   # Age(m, a)
 sql "SELECT id, to_addr, rcpt FROM messages"; sql "SELECT * FROM notifications"   # read rcpt and ncount
 ```
