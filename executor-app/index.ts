@@ -55,11 +55,15 @@ acknowledgements. Check with the owner first only for sending as them, spending,
 or anything touching other people. A requester may end a worker whose job is done; its transcripts stay.
 `;
 
+// Tools checked to only read (the server sends no hints); a failed call to any other is treated as one that may have
+// written. bridge_inbox only lists; bridge_read marks a message read, so it stays out.
+const kinds = { bridge_inbox: 'query', bridge_list_agents: 'query', bridge_status: 'query', bridge_whoami: 'query' } as const;
+
 // The factory also runs without a caller (app-scope work), which has no bridge account and so no tools.
 export default defineApp({ user: { accounts: { service } } }, async ({ user, signal, cache }) => ({
   tools: router(
     // Messages go agent to agent and send nothing as the owner, so no tool asks.
-    user ? withApprovals(await mcpRouter({ url, account: user.accounts.service, headers: headers(user.accounts.service), signal, cache }), () => never()) : router({}),
+    user ? withApprovals(await mcpRouter({ url, account: user.accounts.service, headers: headers(user.accounts.service), signal, cache }, kinds), () => never()) : router({}),
     { title: 'Agent Bridge', description, instructions },
   ),
 }));
